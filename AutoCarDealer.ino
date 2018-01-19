@@ -8,23 +8,34 @@
 /*-----( Import needed libraries )-----*/
 #include "IRremote.h"
 #include "IRremoteInt.h"
-#include "HMC5883L.h"
+#include "DFRobot_QMC5883.h"
+#include "Wire.h"
 
 /*-----( Declare Constants )-----*/
 #define  REPEAT_DELAY  500   // Delay before checking for another button / repeat
 int receiver = 11; // pin 1 of IR receiver to Arduino digital pin 11
                    // NOTE: Other pins can be used, except pin 3 and 13
-                  
+int MotorApin_d = 2;
+int MotorApin_r = 4;
+int MotorBpin_d = 7;
+int MotorBpin_r = 8;
+int MotorCpin_d = 12;
+int MotorCpin_r = 10;
+int Players = 4;
+int CardEach = 13;
+bool isSetPlayer = false;
+bool isSetCardEach = false;
+bool isCompleteSetCard = false;
 /*-----( Declare objects )-----*/
 IRrecv irrecv(receiver);           // create instance of 'irrecv'
 decode_results results;            // create instance of 'decode_results'
 
 /*-----( Declare Variables )-----*/
-int  ButtonValue;  // 0..9,100,200, top 9 buttons encoded 10..18, -1 Bad Code
-int inPin = 7;
+//int  ButtonValue;  // 0..9,100,200, top 9 buttons encoded 10..18, -1 Bad Code
+int inPin = 3;
 //IRrecv irrecv(recvPin);
 //decode_results results;
-HMC5883L compass;
+DFRobot_QMC5883 compass;
 int dx = 0;
 int dy = 0;
 
@@ -34,15 +45,20 @@ void setup()   /*----( SETUP: RUNS ONCE )----*/
   Serial.println("YourDuino.com IR Infrared Remote Control Kit V2");  
   Serial.println("IR Receiver Raw Data + Button Decode Test");
   irrecv.enableIRIn(); // Start the receiver
-  pinMode(2, OUTPUT); //play card PWM
-  pinMode(3, OUTPUT); //play card
-  pinMode(4, OUTPUT); //play card
-  pinMode(5, OUTPUT); //play card
-  pinMode(inPin, INPUT); //play card
-  digitalWrite(2, LOW);
-  digitalWrite(3, LOW);
-  digitalWrite(4, LOW);
-  digitalWrite(5, LOW);
+  pinMode(MotorApin_d, OUTPUT); //Motor A and Motor B drive the wheel of the card dealer car
+  pinMode(MotorApin_r, OUTPUT);
+  pinMode(MotorBpin_d, OUTPUT);
+  pinMode(MotorBpin_r, OUTPUT);
+  pinMode(MotorCpin_d, OUTPUT); //Motor C is the drive wheel to deal the card
+  pinMode(MotorCpin_r, OUTPUT);
+  pinMode(inPin, INPUT);
+  digitalWrite(MotorApin_d, LOW);
+  digitalWrite(MotorApin_r, LOW);
+  digitalWrite(MotorBpin_d, LOW);
+  digitalWrite(MotorBpin_r, LOW);
+  digitalWrite(MotorCpin_d, LOW);
+  digitalWrite(MotorCpin_r, LOW);
+  InitCompass();
   
 }/*--(end setup )---*/
 
@@ -52,9 +68,10 @@ void loop()   /*----( LOOP: RUNS CONSTANTLY )----*/
   if (irrecv.decode(&results)) // have we received an IR signal?
 
   {
-//    Serial.println(results.value, HEX); // UN Comment to see raw values
-    ButtonValue = translateIR(); 
-    Serial.println(ButtonValue, DEC);
+    Serial.println(results.value, HEX); // UN Comment to see raw values
+    //ButtonValue = translateIR(); 
+    TranslateIR();
+    //Serial.println(ButtonValue, DEC);
     delay(REPEAT_DELAY);    // Adjust for repeat / lockout time
     irrecv.resume(); // receive the next value
 
@@ -64,16 +81,31 @@ void loop()   /*----( LOOP: RUNS CONSTANTLY )----*/
 
 void InitCompass()
 {
-Serial.println("Initialize HMC5883L");
+Serial.println("Initialize QMC5883");
 while (!compass.begin())
 {
-Serial.println("HMC5883L not found, check the connection!");
+Serial.println("QMC5883 not found, check the connection!");
 delay(500);
 }
-compass.setRange(HMC5883L_RANGE_1_3GA);
-compass.setMeasurementMode(HMC5883L_CONTINOUS);
-compass.setDataRate(HMC5883L_DATARATE_75HZ);
-compass.setSamples(HMC5883L_SAMPLES_4);
+    if(compass.isHMC()){
+        Serial.println("Initialize HMC5883L");
+        compass.setRange(HMC5883L_RANGE_1_3GA);
+        compass.setMeasurementMode(HMC5883L_CONTINOUS);
+        compass.setDataRate(HMC5883L_DATARATE_15HZ);
+        compass.setSamples(HMC5883L_SAMPLES_8);
+    }
+   else if(compass.isQMC()){
+        Serial.println("Initialize QMC5883");
+        compass.setRange(QMC5883_RANGE_2GA);
+        compass.setMeasurementMode(QMC5883_CONTINOUS); 
+        compass.setDataRate(QMC5883_DATARATE_50HZ);
+        compass.setSamples(QMC5883_SAMPLES_8);
+   }
+
+//compass.setRange(HMC5883L_RANGE_1_3GA);
+//compass.setMeasurementMode(HMC5883L_CONTINOUS);
+//compass.setDataRate(HMC5883L_DATARATE_75HZ);
+//compass.setSamples(HMC5883L_SAMPLES_4);
 }
 
 int GetHeading()
@@ -86,8 +118,9 @@ return heading;
 
 void CompassCalibrate()
 {
-analogWrite(9, 255);
-digitalWrite(8, 1); // start player motor
+//analogWrite(9, 255);
+digitalWrite(MotorApin_d, HIGH); // start player motor
+digitalWrite(MotorBpin_r, HIGH); // start player motor
 int dx_max = -10000;
 int dx_min = 10000;
 int dy_max = -10000;
@@ -104,7 +137,8 @@ if (norm.YAxis < dy_min) dy_min = norm.YAxis;
 delay(5);
 }
 
-digitalWrite(8, 0); // stop player motor
+digitalWrite(MotorApin_d, LOW); // stop player motor
+digitalWrite(MotorBpin_r, LOW); // stop player motor
 dx = (dx_max + dx_min) / 2;
 dy = (dy_max + dy_min) / 2;
 
@@ -117,39 +151,49 @@ Serial.println(dy);
 
 int Player(int pos)
 {
-analogWrite(9, 150);
-digitalWrite(8, 1); // start player motor
+//analogWrite(9, 150);
+digitalWrite(MotorApin_d, HIGH); // start player motor
+digitalWrite(MotorBpin_r, HIGH); // start player motor
 int prePos = GetHeading() - pos;
+Serial.print("Pos is:");
+Serial.println(pos);
+Serial.print("prePos is:");
+Serial.println(prePos);
 unsigned long t = millis();
 while (millis() - t < 4000)
 {
 delay(5);
 int curPos = GetHeading() - pos;
+Serial.print("curPos is:");
+Serial.println(curPos);
 if (prePos <= 0 && curPos >= 0)
 {
-digitalWrite(8, 0); // stop player motor
+digitalWrite(MotorApin_d, LOW); // stop player motor
+digitalWrite(MotorBpin_r, LOW); // stop player motor
 return 1;
 }
 prePos = curPos;
 }
-digitalWrite(8, 0); // stop player motor
+digitalWrite(MotorApin_d, LOW); // stop player motor
+digitalWrite(MotorBpin_r, LOW); // stop player motor
 return 0;
 }
 
 int PlayCard()
 {
-digitalWrite(5, 1);
+delay(5);
+digitalWrite(MotorCpin_d, HIGH);
 unsigned long t = millis();
 while (millis() - t < 2000)
 {
 if (digitalRead(inPin) == LOW)
 {
 delay(70);
-digitalWrite(5, 0);
+digitalWrite(MotorCpin_d, LOW);
 return 1;
 }
 }
-digitalWrite(5, 0);
+digitalWrite(MotorCpin_d, LOW);
 return 0;
 }
 
@@ -165,6 +209,7 @@ delay(200);
 }
 }
 /*-----( Declare User-written Functions )-----*/
+/*
 int translateIR() // returns value of "Car MP3 remote IR code received
 
 {
@@ -174,28 +219,28 @@ int translateIR() // returns value of "Car MP3 remote IR code received
   {
 
   case 0xFFA25D:  
-    digitalWrite(2, HIGH);
+    digitalWrite(MotorApin_d, HIGH);
     delay(2000);
-    digitalWrite(2, LOW);
+    digitalWrite(MotorApin_d, LOW);
     return 10;  // CH-
     break;
 
   case 0xFF629D:  
-    digitalWrite(5, HIGH);
+    digitalWrite(MotorBpin_r, HIGH);
     delay(2000);
-    digitalWrite(5, LOW);
+    digitalWrite(MotorBpin_r, LOW);
     return 11; // CH
     break;
 
   case 0xFFE21D:  
-    digitalWrite(2, LOW);
-    Serial.println("pin2 set as low");
+    digitalWrite(MotorApin_d, LOW);
+    Serial.println("MotorApin_d set as low");
     return 12; // CH+
     break;
 
   case 0xFF22DD:  
-    digitalWrite(5, LOW);
-    Serial.println("pin5 set as low");
+    digitalWrite(MotorBpin_r, LOW);
+    Serial.println("MotorBpin_r set as low");
     return 13; // PREV
     break;
 
@@ -272,12 +317,151 @@ int translateIR() // returns value of "Car MP3 remote IR code received
     return -2; // REPEAT: Button Held down longer than 
     break;
   default: 
-    return -1; // Other Button  / Bad Code
-
-  } //END case
-
+    break;//return -1; // Other Button  / Bad Code
+  }
+  delay(100); //END case
 } //END translateIR
+*/
 
+void TranslateIR() // takes action based on IR code received // describing Car MP3 IR codes
+{
+switch (results.value)
+{
+
+  case 0xFFA25D:  
+    Serial.println(" CH-            "); 
+    break;
+
+  case 0xFF629D:  
+    Serial.println(" CH             "); 
+    break;
+
+  case 0xFFE21D:  
+    Serial.println(" CH+            "); 
+    break;
+  
+  case 0xFF22DD:
+    Serial.println(" PREV ");
+    break;
+  case 0xFF02FD:
+    Serial.println(" NEXT ");
+    PlayCard();
+    break;
+  case 0xFFC23D:
+    Serial.println(" PLAY/PAUSE ");
+    Deal();
+    break;
+
+  case 0xFFE01F:  
+    Serial.println(" VOL-           "); 
+    isSetPlayer = true;
+    break;
+
+  case 0xFFA857:  
+    Serial.println(" VOL+           "); 
+    iSetCardEach = true;
+    isCompleteCardEach = true;
+    break;
+
+  case 0xFF906F:
+    Serial.println(" EQ ");
+    CompassCalibrate();
+    break;
+
+  case 0xFF6897:  
+    Serial.println(" 0              "); 
+    if (isSetPlayer)
+        {
+        Players = 4;
+        CardEach = 13;
+        isSetPlayer = false;
+        }
+    else
+      //compass.Turn(EAST); 
+    break;
+
+  case 0xFF30CF:
+    Serial.println(" 1 ");
+    if (isSetPlayer){
+      Players = 1;
+      isSetPlayer = false;
+      }
+    else if (isSetCardEach){
+      if (isCompleteCardEach)
+        CardEach = 1;
+        isCompleteCardEach = false;
+      else
+      {
+        CardEach = CardEach*10 + 1;
+        isSetCardEach = false;
+      }
+      }
+    else
+      Player(60);
+    break;
+  case 0xFF18E7:
+    Serial.println(" 2 ");
+    if (isSetPlayer){
+      Players = 2;
+      isSetPlayer = false;
+      }
+    else if (isSetCardEach){
+      if (isCompleteCardEach)
+        CardEach = 2;
+        isCompleteCardEach = false;
+      else
+      {
+        CardEach = CardEach*10 + 2;
+        isSetCardEach = false;
+      }
+      }
+    else
+      Player(150);
+    break;
+  case 0xFF7A85:
+    Serial.println(" 3 ");
+    if (isSetPlayer){
+      Players = 3;
+      isSetPlayer = false;
+      }
+    else if (isSetCardEach){
+      if (isCompleteCardEach)
+        CardEach = 3;
+        isCompleteCardEach = false;
+      else
+      {
+        CardEach = CardEach*10 + 3;
+        isSetCardEach = false;
+      }
+      }
+    else
+      Player(240);
+    break;
+  case 0xFF10EF:
+    Serial.println(" 4 ");
+    if (isSetPlayer){
+      Players = 4;
+      isSetPlayer = false;
+      }
+    else if (isSetCardEach){
+      if (isCompleteCardEach)
+        CardEach = 4;
+        isCompleteCardEach = false;
+      else
+      {
+        CardEach = CardEach*10 + 4;
+        isSetCardEach = false;
+      }
+      }
+    else
+      Player(330);
+    break;
+  default:
+  //Serial.println(" other button ");
+    break;
+}
+delay(100);
+} //END TranslateIR
 
 
 /* ( THE END ) */
