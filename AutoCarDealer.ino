@@ -24,10 +24,10 @@ int MotorCpin_r = 10;
 int iPlayers = 4;           //set 4 default players
 int iCardEach = 13;         //set 13 playing cards for each one as default
 int iPlayerDistance = 90;   //set 90 degrees for players distance
-int iDealCards = 2000;
-bool isSetPlayer = false;
-bool isSetCardForEach = false;
-bool isDoneSetCardForEach = false;
+int iDealCards = 2000;      //dealing one card with 2 seconds
+bool isSetPlayer = false;   //will set players number if true
+bool isSetCardForEach = false;//will set card for each player if true
+bool isDoneSetCardForEach = false;//completed set card for each player if true
 /*-----( Declare objects )-----*/
 IRrecv irrecv(receiver);           // create instance of 'irrecv'
 decode_results results;            // create instance of 'decode_results'
@@ -89,6 +89,7 @@ void InitCompass()
         compass.setMeasurementMode(HMC5883L_CONTINOUS);
         compass.setDataRate(HMC5883L_DATARATE_15HZ);
         compass.setSamples(HMC5883L_SAMPLES_8);
+        if (DEBUG) Serial.println("Initialize HMC5883L Completed");
     }
     else if(compass.isQMC()){
         if (DEBUG) Serial.println("Initialize QMC5883");
@@ -96,6 +97,7 @@ void InitCompass()
         compass.setMeasurementMode(QMC5883_CONTINOUS); 
         compass.setDataRate(QMC5883_DATARATE_50HZ);
         compass.setSamples(QMC5883_SAMPLES_8);
+        if (DEBUG) Serial.println("Initialize QMC5883 Completed");
     }
 }
 
@@ -167,9 +169,11 @@ void CompassCalibrate()
 
 int Player(int pos)
 {
-  //analogWrite(9, 150);
+  pos = pos % 360;
   digitalWrite(MotorApin_d, HIGH); // start player motor
+  if (DEBUG) Serial.println("Motor A pin d set to high");
   digitalWrite(MotorBpin_r, HIGH); // start player motor
+  if (DEBUG) Serial.println("Motor B pin r set to high");
   int prePos = GetHeadingDegrees() - pos;
   if (DEBUG){
     Serial.print("Pos is:");
@@ -186,14 +190,22 @@ int Player(int pos)
       Serial.println(curPos);
     }
     if (prePos <= 0 && curPos >= 0){
+      delay(50);
       digitalWrite(MotorApin_d, LOW); // stop player motor
+      if (DEBUG) Serial.println("Motor A pin d set to low");
       digitalWrite(MotorBpin_r, LOW); // stop player motor
+      if (DEBUG) Serial.println("Motor B pin r set to low");
+	  delay(50);
       return 1;
     }
     prePos = curPos;
   }
+  delay(50);
   digitalWrite(MotorApin_d, LOW); // stop player motor
+  if (DEBUG) Serial.println("Motor A pin d set to low");
   digitalWrite(MotorBpin_r, LOW); // stop player motor
+  if (DEBUG) Serial.println("Motor B pin r set to low");
+  delay(50);
   return 0;
 }
 
@@ -201,24 +213,30 @@ int PlayCard()
 {
   delay(5);
   digitalWrite(MotorCpin_d, HIGH);
+  if (DEBUG) Serial.println("Motor C pin d set to high");
   unsigned long t = millis();
   while (millis() - t < iDealCards){
     if (digitalRead(inPin) == LOW){
+	  if (DEBUG) Serial.println("Low signal detected of the infrared obstacle avoidance");
       delay(70);
       digitalWrite(MotorCpin_d, LOW);
+	  if (DEBUG) Serial.println("Motor C pin d set to low");
       return 1;
     }
   }
   digitalWrite(MotorCpin_d, LOW);
+  if (DEBUG) Serial.println("Motor C pin d set to low");
   return 0;
 }
 
 void Deal()
 {
-  int pos = 0;
+  int pos = 60;
   for (int i = 0; i < iPlayers*iCardEach; i++){
     if (Player(pos) == 0) break;
+    delay(1000);
     if (PlayCard() == 0) break;
+    delay(1000);
     pos = (pos + iPlayerDistance) % 360;
     delay(200);
   }
@@ -247,7 +265,7 @@ void NumberProcessing(int number){
       }
       }
     else
-      Player((number-1)*iPlayerDistance);
+      Player((number-1)*iPlayerDistance+60);
   }
 /*-----( Declare User-written Functions )-----*/
 
@@ -258,6 +276,14 @@ switch (results.value)
 
   case 0xFFA25D:  
     if(DEBUG) Serial.println(" CH-            "); 
+    delay(50);
+    digitalWrite(MotorApin_d, LOW);
+    digitalWrite(MotorApin_r, LOW);
+    digitalWrite(MotorBpin_d, LOW);
+    digitalWrite(MotorBpin_r, LOW);
+    digitalWrite(MotorCpin_d, LOW);
+    digitalWrite(MotorCpin_r, LOW);
+    delay(50);    
     break;
 
   case 0xFF629D:  
@@ -281,7 +307,9 @@ switch (results.value)
     break;
   case 0xFFC23D:
     if(DEBUG) Serial.println(" PLAY/PAUSE ");
+    delay(500);
     Deal();
+    delay(500);
     break;
 
   case 0xFFE01F:  
@@ -304,12 +332,25 @@ switch (results.value)
     if(DEBUG) Serial.println(" 0 "); 
     if (isSetPlayer)
         {
-        iPlayers = 4;
-        iCardEach = 13;
-        isSetPlayer = false;
+        iPlayers = 4;           //set 4 default players
+        iCardEach = 13;         //set 13 playing cards for each one as default
+        iPlayerDistance = 90;   //set 90 degrees for players distance
+        iDealCards = 2000;      //dealing one card with 2 seconds
+        isSetPlayer = false;   //will set players number if true
+        isSetCardForEach = false;//will set card for each player if true
+        isDoneSetCardForEach = false;//completed set card for each player if true
         }
     else
-      //compass.Turn(EAST); 
+        {
+        iPlayers = 4;           //set 4 default players
+        iCardEach = 13;         //set 13 playing cards for each one as default
+        iPlayerDistance = 90;   //set 90 degrees for players distance
+        iDealCards = 2000;      //dealing one card with 2 seconds
+        isSetPlayer = false;   //will set players number if true
+        isSetCardForEach = false;//will set card for each player if true
+        isDoneSetCardForEach = false;//completed set card for each player if true
+        //compass.Turn(EAST); 
+        }
     break;
 
   case 0xFF9867:  
@@ -372,4 +413,5 @@ switch (results.value)
 delay(100);
 } //END TranslateIR
 /* ( THE END ) */
+
 
