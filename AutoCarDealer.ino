@@ -1,22 +1,11 @@
-/* This is the auto playing cards dealer machine */
+/* This is the auto playing cards dealer machine made by William Shi*/
 
 /*-----( Import needed libraries )-----*/
 #include "IRremote.h"
-//#include "IRremoteInt.h"
-#include "DFRobot_QMC5883.h"
+#include "QMC5883.h"
 #include "Wire.h"
 #define DEBUGLEVEL 1
 /*-----( Declare Constants )-----*/
-//#define  500  500   // Delay before checking for another button / repeat
-//int 11 = 11;           // pin 1 of IR 11 to Arduino digital pin 11
-/*                             // NOTE: Other pins can be used, except pin 3 and 13
-  int 5 = 5;
-  int 4 = 4;
-  int 7 = 7;
-  int 8 = 8;
-  int 12 = 12;
-  int 10 = 10;
-*/
 int iPlayers = 4;           //set 4 default players
 int iCardEach = 13;         //set 13 playing cards for each one as default
 int iPlayerDistance = 90;   //set 90 degrees for players distance
@@ -31,7 +20,7 @@ decode_results results;            // create instance of 'decode_results'
 
 /*-----( Declare Variables )-----*/
 //int 6 = 6;       // pin 6 for get signal from the infrared obstacle avoidance module
-DFRobot_QMC5883 compass;
+QMC5883 compass;
 //int dx = 0;
 //int dy = 0;
 
@@ -57,7 +46,8 @@ void setup()   /*----( SETUP: RUNS ONCE )----*/
   digitalWrite(12, LOW);
   digitalWrite(10, LOW);
   //randomSeed(analogRead(9));  //random number for random card dealing
-  InitCompass();
+  //InitCompass();
+  compass.begin();
 }/*--(end setup )---*/
 
 
@@ -72,9 +62,9 @@ void loop()   /*----( LOOP: RUNS CONSTANTLY )----*/
   }
   //delay(10);
 }/* --(end main loop )-- */
-
-void InitCompass()
-{
+/*
+  void InitCompass()
+  {
   if (DEBUGLEVEL) Serial.println("Initialize QMC5883");
   while (!compass.begin()) {
     if (DEBUGLEVEL) Serial.println("QMC5883 not found, check the connection!");
@@ -86,10 +76,55 @@ void InitCompass()
   compass.setDataRate(QMC5883_DATARATE_50HZ);
   compass.setSamples(QMC5883_SAMPLES_8);
   if (DEBUGLEVEL) Serial.println("Initialize QMC5883 Completed");
+  }
+*/
+void CompassCalibrate()
+{
+  int minX = 0;
+  int maxX = 0;
+  int minY = 0;
+  int maxY = 0;
+  int minZ = 0;
+  int maxZ = 0;
+  digitalWrite(5, 1);
+  digitalWrite(8, 1);
+  unsigned long t = millis();
+  while ((millis() - t) < 4000) {
+    delay(5);
+    Vector mag = compass.readRaw();
+    if (mag.XAxis < minX) minX = mag.XAxis;
+    if (mag.XAxis > maxX) maxX = mag.XAxis;
+    if (mag.YAxis < minY) minY = mag.YAxis;
+    if (mag.YAxis > maxY) maxY = mag.YAxis;
+    if (mag.ZAxis < minZ) minZ = mag.ZAxis;
+    if (mag.ZAxis > maxZ) maxZ = mag.ZAxis;
+    if (DEBUGLEVEL){
+      Serial.println("in CompassCalibrate to print the mag raw value................................");
+      Serial.println(mag.XAxis);
+      Serial.println(mag.YAxis);
+      Serial.println(mag.ZAxis);
+      Serial.println(minX);
+      Serial.println(maxX);
+      Serial.println(minY);
+      Serial.println(maxY);
+      Serial.println(minZ);
+      Serial.println(maxZ);
+      }
+  }
+  compass.setOffset((uint16_t)((minX + maxX) / 2), (uint16_t)((minY + maxY) / 2), (uint16_t)((minZ + maxZ) / 2));
+  if(DEBUGLEVEL){
+    Serial.println("in CompassCalibrate to print the offset XYZ");
+    Serial.println((uint16_t)((minX + maxX) / 2));
+    Serial.println((uint16_t)((minY + maxY) / 2));
+    Serial.println((uint16_t)((minZ + maxZ) / 2));
+    }
+  digitalWrite(5, 0);
+  digitalWrite(8, 0);
 }
 
-int GetHeadingDegrees()
-{
+/*
+  int compass.readHeading()
+  {
   Vector norm = compass.readNormalize();
 
   // Calculate heading
@@ -123,12 +158,13 @@ int GetHeadingDegrees()
   }
   ////delay(10);
   return headingDegrees;
-}
+  }
+*/
 
 int Player(int pos)
 {
   pos = pos % 360;
-  int prePos = GetHeadingDegrees() - pos;
+  int prePos = compass.readHeading() - pos;
   if (DEBUGLEVEL) {
     Serial.print("parameter pos is:");
     Serial.println(pos);
@@ -142,8 +178,8 @@ int Player(int pos)
   unsigned long t = millis();
   while ((millis() - t) < 3000) {
     if (DEBUGLEVEL) Serial.println("Enter while loop of Player");
-    delay(5);
-    int curPos = GetHeadingDegrees() - pos;
+    //delay(5);
+    int curPos = compass.readHeading() - pos;
     if (DEBUGLEVEL) {
       Serial.print("prePos is                :");
       Serial.println(prePos);
@@ -225,7 +261,7 @@ void NumberProcessing(int number) {
     }
   }
   else
-    Player((number - 1)*iPlayerDistance + 60);
+    Player((number - 1)*iPlayerDistance + 45);
 }
 /*-----( Declare User-written Functions )-----*/
 /*
@@ -412,9 +448,9 @@ void translateir() // takes action based on IR code received // describing Car M
       break;
     case 0x3778AFF2:
       if (DEBUGLEVEL) Serial.println(" OK PLAY/PAUSE ");
-      delay(500);
+      //delay(500);
       Deal();
-      delay(500);
+      //delay(500);
       break;
 
     case 0xB1DD4311:
@@ -430,7 +466,7 @@ void translateir() // takes action based on IR code received // describing Car M
 
     case 0xBD4971EE:
       if (DEBUGLEVEL) Serial.println(" INFO ");
-      //CompassCalibrate();
+      CompassCalibrate();
       break;
 
     case 0xC1EE7333:
