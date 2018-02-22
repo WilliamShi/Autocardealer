@@ -5,17 +5,20 @@
 #include "QMC5883.h"
 #include "Wire.h"
 #define DEBUGLEVEL 1
+//#define cSpeed 130
+//#define cSpeed 130
 /*-----( Declare Constants )-----*/
+byte cSpeed = 130;
 int iPlayers = 4;           //set 4 default players
 int iCardEach = 13;         //set 13 playing cards for each one as default
 int iPlayerDistance = 90;   //set 90 degrees for players distance
-unsigned long iDealCards = 2000;      //dealing one card with 2 seconds
+unsigned long iDealCards = 4000;      //dealing one card with 2 seconds
 //unsigned long iIntervalofgotoplayer = 4000;
 bool isSetPlayer = false;   //will set players number if true
 bool isSetCardForEach = false;//will set card for each player if true
 bool isDoneSetCardForEach = false;//completed set card for each player if true
 /*-----( Declare objects )-----*/
-IRrecv irrecv(11);         // create instance of 'irrecv'
+IRrecv irrecv(12);         // create instance of 'irrecv'
 decode_results results;            // create instance of 'decode_results'
 
 /*-----( Declare Variables )-----*/
@@ -31,19 +34,19 @@ void setup()   /*----( SETUP: RUNS ONCE )----*/
     Serial.println("YourDuino.com IR Infrared Remote Control Kit V2");
     Serial.println("IR Receiver Raw Data + Button Decode Test");
   }
-  irrecv.enableIRIn(); // Start the 11
+  irrecv.enableIRIn(); // Start the 12
   pinMode(5, OUTPUT); //Motor A and Motor B drive the wheel of the card dealer car
-  pinMode(4, OUTPUT);
-  pinMode(7, OUTPUT);
-  pinMode(8, OUTPUT);
-  pinMode(12, OUTPUT); //Motor C is the drive wheel to deal the card
+  pinMode(3, OUTPUT);
+  pinMode(6, OUTPUT);
+  pinMode(9, OUTPUT);
+  pinMode(11, OUTPUT); //Motor C is the drive wheel to deal the card
   pinMode(10, OUTPUT);
-  pinMode(6, INPUT);
+  pinMode(7, INPUT);
   digitalWrite(5, LOW);
-  digitalWrite(4, LOW);
-  digitalWrite(7, LOW);
-  digitalWrite(8, LOW);
-  digitalWrite(12, LOW);
+  digitalWrite(3, LOW);
+  digitalWrite(6, LOW);
+  digitalWrite(9, LOW);
+  digitalWrite(11, LOW);
   digitalWrite(10, LOW);
   //randomSeed(analogRead(9));  //random number for random card dealing
   //InitCompass();
@@ -86,8 +89,10 @@ void CompassCalibrate()
   int maxY = 0;
   int minZ = 0;
   int maxZ = 0;
-  digitalWrite(5, 1);
-  digitalWrite(8, 1);
+  analogWrite(5, cSpeed);
+  analogWrite(9, cSpeed);
+  //digitalWrite(5, 1);
+  //digitalWrite(9, 1);
   unsigned long t = millis();
   while ((millis() - t) < 4000) {
     delay(5);
@@ -119,7 +124,7 @@ void CompassCalibrate()
     Serial.println((uint16_t)((minZ + maxZ) / 2));
     }
   digitalWrite(5, 0);
-  digitalWrite(8, 0);
+  digitalWrite(9, 0);
 }
 
 /*
@@ -171,14 +176,16 @@ int Player(int pos)
     Serial.print("first prePos is:");
     Serial.println(prePos);
   }
-  digitalWrite(5, HIGH); // start player motor
+  analogWrite(5, cSpeed);
+  //digitalWrite(5, HIGH); // start player motor
   if (DEBUGLEVEL) Serial.println("Motor A pin d set to high");
-  digitalWrite(8, HIGH); // start player motor
+  analogWrite(9,cSpeed);
+  //digitalWrite(9, HIGH); // start player motor
   if (DEBUGLEVEL) Serial.println("Motor B pin r set to high");
   unsigned long t = millis();
-  while ((millis() - t) < 3000) {
+  while ((millis() - t) < 4000) {
     if (DEBUGLEVEL) Serial.println("Enter while loop of Player");
-    //delay(5);
+    delay(5);
     int curPos = compass.readHeading() - pos;
     if (DEBUGLEVEL) {
       Serial.print("prePos is                :");
@@ -189,7 +196,7 @@ int Player(int pos)
     if ((prePos <= 0) && (curPos >= 0)) {
       digitalWrite(5, LOW); // stop player motor
       if (DEBUGLEVEL) Serial.println("Motor A pin d set to low");
-      digitalWrite(8, LOW); // stop player motor
+      digitalWrite(9, LOW); // stop player motor
       if (DEBUGLEVEL) Serial.println("Motor B pin r set to low");
       if (DEBUGLEVEL) Serial.println("Turn to right angle");
       return 1;
@@ -199,27 +206,27 @@ int Player(int pos)
   if (DEBUGLEVEL) Serial.println("Time exceed 4s");
   digitalWrite(5, LOW); // stop player motor
   if (DEBUGLEVEL) Serial.println("Motor A pin d set to low");
-  digitalWrite(8, LOW); // stop player motor
-  if (DEBUGLEVEL) Serial.println("Motor B pin r set to low");
+  digitalWrite(9, LOW); // stop player motor
+  if (DEBUGLEVEL) Serial.println("Motor B pin r set to low");                                                                                                                                   
   return 0;
 }
 
 int PlayCard()
 {
   delay(5);
-  digitalWrite(12, HIGH);
+  digitalWrite(10, HIGH);
   if (DEBUGLEVEL) Serial.println("Motor C pin d set to high");
   unsigned long t = millis();
   while ((millis() - t) < iDealCards) {
-    if (digitalRead(6) == LOW) {
+    if (digitalRead(7) == LOW) {
       if (DEBUGLEVEL) Serial.println("Low signal detected of the infrared obstacle avoidance");
       delay(70);
-      digitalWrite(12, LOW);
+      digitalWrite(10, LOW);
       if (DEBUGLEVEL) Serial.println("Motor C pin d set to low");
       return 1;
     }
   }
-  digitalWrite(12, LOW);
+  digitalWrite(10, LOW);
   if (DEBUGLEVEL) {
     Serial.println("time exceeds iDealCards 2s");
     Serial.println("Motor C pin d set to low");
@@ -261,7 +268,7 @@ void NumberProcessing(int number) {
     }
   }
   else
-    Player((number - 1)*iPlayerDistance + 45);
+    Player((number - 1)*iPlayerDistance + 60);
 }
 /*-----( Declare User-written Functions )-----*/
 /*
@@ -419,10 +426,10 @@ void translateir() // takes action based on IR code received // describing Car M
       if (DEBUGLEVEL) Serial.println(" |<            ");
       delay(50);
       digitalWrite(5, LOW);
-      digitalWrite(4, LOW);
-      digitalWrite(7, LOW);
-      digitalWrite(8, LOW);
-      digitalWrite(12, LOW);
+      digitalWrite(3, LOW);
+      digitalWrite(6, LOW);
+      digitalWrite(9, LOW);
+      digitalWrite(11, LOW);
       digitalWrite(10, LOW);
       delay(50);
       break;
@@ -441,10 +448,13 @@ void translateir() // takes action based on IR code received // describing Car M
 
     case 0xD99766D5:
       if (DEBUGLEVEL) Serial.println(" << ");
+      if (cSpeed > 130) cSpeed -= 5;
       break;
     case 0xAC4BDD79:
       if (DEBUGLEVEL) Serial.println(" >> ");
-      PlayCard();
+      if (cSpeed == 255) cSpeed =130;
+      else cSpeed += 5;
+      //PlayCard();
       break;
     case 0x3778AFF2:
       if (DEBUGLEVEL) Serial.println(" OK PLAY/PAUSE ");
