@@ -5,10 +5,10 @@
 #include "QMC5883.h"
 #include "Wire.h"
 #define DEBUGLEVEL 1
-//#define cSpeed 130
-//#define cSpeed 130
+
 /*-----( Declare Constants )-----*/
-byte cSpeed = 130;
+byte cWheelSpeed = 130;
+byte cDriveSpeed = 200;
 int iPlayers = 4;           //set 4 default players
 int iCardEach = 13;         //set 13 playing cards for each one as default
 int iPlayerDistance = 90;   //set 90 degrees for players distance
@@ -89,8 +89,8 @@ void CompassCalibrate()
   int maxY = 0;
   int minZ = 0;
   int maxZ = 0;
-  analogWrite(5, cSpeed);
-  analogWrite(9, cSpeed);
+  analogWrite(5, cWheelSpeed);
+  analogWrite(9, cWheelSpeed);
   //digitalWrite(5, 1);
   //digitalWrite(9, 1);
   unsigned long t = millis();
@@ -176,10 +176,10 @@ int Player(int pos)
     Serial.print("first prePos is:");
     Serial.println(prePos);
   }
-  analogWrite(5, cSpeed);
+  analogWrite(5, cWheelSpeed);
   //digitalWrite(5, HIGH); // start player motor
   if (DEBUGLEVEL) Serial.println("Motor A pin d set to high");
-  analogWrite(9,cSpeed);
+  analogWrite(9,cWheelSpeed);
   //digitalWrite(9, HIGH); // start player motor
   if (DEBUGLEVEL) Serial.println("Motor B pin r set to high");
   unsigned long t = millis();
@@ -215,6 +215,7 @@ int PlayCard()
 {
   delay(5);
   digitalWrite(10, HIGH);
+  //analogWrite(10, cDriveSpeed);
   if (DEBUGLEVEL) Serial.println("Motor C pin d set to high");
   unsigned long t = millis();
   while ((millis() - t) < iDealCards) {
@@ -421,46 +422,68 @@ void translateir() // takes action based on IR code received // describing Car M
 {
   switch (results.value)
   {
+    //case 0xC4194E9F:
+    //  if (DEBUGLEVEL) Serial.println("POWER");
+    //  break;
+
+    //case 0x413D9ECB:
+    //  if (DEBUGLEVEL) Serial.println("MENU");
+    //  break;
+
+    case 0xBD4971EE:
+      if (DEBUGLEVEL) Serial.println(" INFO ");
+      CompassCalibrate();
+      break;
 
     case 0xC544EDC4:
       if (DEBUGLEVEL) Serial.println(" |<            ");
-      delay(50);
-      digitalWrite(5, LOW);
-      digitalWrite(3, LOW);
-      digitalWrite(6, LOW);
-      digitalWrite(9, LOW);
-      digitalWrite(11, LOW);
-      digitalWrite(10, LOW);
-      delay(50);
-      break;
-
-    case 0x9962293B:
-      if (DEBUGLEVEL) Serial.println(" -^             ");
+      if (cDriveSpeed > 180) cWheelSpeed -= 5;
       break;
 
     case 0x555E3747:
       if (DEBUGLEVEL) Serial.println(" >|            ");
+      if (cDriveSpeed >= 255) cWheelSpeed =200;
+      else cDriveSpeed += 5;
+      break;
+
+
+    case 0x9962293B:
+      if (DEBUGLEVEL) Serial.println(" -^             ");
       iDealCards += 1000;
-      if (iDealCards > 3000) {
-        iDealCards %= 3000;
+      if (iDealCards > 4000) {
+        iDealCards %= 4000;
       }
+      break;
+
+    case 0xE02921AB:
+      if (DEBUGLEVEL) Serial.println(" -V             ");
+      PlayCard();
       break;
 
     case 0xD99766D5:
       if (DEBUGLEVEL) Serial.println(" << ");
-      if (cSpeed > 130) cSpeed -= 5;
+      if (cWheelSpeed > 130) cWheelSpeed -= 5;
       break;
     case 0xAC4BDD79:
       if (DEBUGLEVEL) Serial.println(" >> ");
-      if (cSpeed == 255) cSpeed =130;
-      else cSpeed += 5;
-      //PlayCard();
+      if (cWheelSpeed >= 255) cWheelSpeed =130;
+      else cWheelSpeed += 5;
       break;
+
+    //case 0xFE5F5ABA:
+    //  if (DEBUGLEVEL) Serial.println(" ^ ");
+    //  break;
+
+    //case 0xA86901ED:
+    //  if (DEBUGLEVEL) Serial.println(" V ");
+    //  iPlayerDistance += 10;
+    //  if (iPlayerDistance > 90)
+    //    iPlayerDistance = 30;
+    //  break;
+
     case 0x3778AFF2:
       if (DEBUGLEVEL) Serial.println(" OK PLAY/PAUSE ");
-      //delay(500);
       Deal();
-      //delay(500);
       break;
 
     case 0xB1DD4311:
@@ -474,47 +497,35 @@ void translateir() // takes action based on IR code received // describing Car M
       isDoneSetCardForEach = true;
       break;
 
-    case 0xBD4971EE:
-      if (DEBUGLEVEL) Serial.println(" INFO ");
-      CompassCalibrate();
-      break;
+    //case 0xF72673E5:
+    //  if (DEBUGLEVEL) Serial.println(" BACK            ");
+    //  delay(50);
+    //  break;
 
-    case 0xC1EE7333:
-      if (DEBUGLEVEL) Serial.println(" 0 ");
-      if (isSetPlayer)
-      {
-        iPlayers = 4;           //set 4 default players
-        iCardEach = 13;         //set 13 playing cards for each one as default
-        iPlayerDistance = 90;   //set 90 degrees for players distance
-        iDealCards = 2000;      //dealing one card with 2 seconds
-        isSetPlayer = false;   //will set players number if true
-        isSetCardForEach = false;//will set card for each player if true
-        isDoneSetCardForEach = false;//completed set card for each player if true
-      }
-      else
-      {
-        iPlayers = 4;           //set 4 default players
-        iCardEach = 13;         //set 13 playing cards for each one as default
-        iPlayerDistance = 90;   //set 90 degrees for players distance
-        iDealCards = 2000;      //dealing one card with 2 seconds
-        isSetPlayer = false;   //will set players number if true
-        isSetCardForEach = false;//will set card for each player if true
-        isDoneSetCardForEach = false;//completed set card for each player if true
-        //compass.Turn(EAST);
-      }
-      break;
+    //case 0x1A73A002:
+    //  if (DEBUGLEVEL) Serial.println(" TV          ");
+    //  delay(50);
+    //  break;
 
-    case 0xFE5F5ABA:
-      if (DEBUGLEVEL) Serial.println(" ^ ");
-      break;
+    //case 0x2C1A30C0:
+    //  if (DEBUGLEVEL) Serial.println(" RED          ");
+    //  delay(50);
+    //  break;
 
-    case 0xA86901ED:
-      if (DEBUGLEVEL) Serial.println(" V ");
-      iPlayerDistance += 10;
-      if (iPlayerDistance > 90)
-        iPlayerDistance = 30;
-      break;
+    //case 0xEC9A1456:
+    //  if (DEBUGLEVEL) Serial.println(" GREEN          ");
+    //  delay(50);
+    //  break;
 
+    //case 0xAFB8F47A:
+    //  if (DEBUGLEVEL) Serial.println(" YELLOW          ");
+    //  delay(50);
+    //  break;
+
+    //case 0x73D1C5DB:
+    //  if (DEBUGLEVEL) Serial.println(" BLUE          ");
+    //  delay(50);
+    //  break;
     case 0xA877CD25:
       if (DEBUGLEVEL) Serial.println(" 1 ");
       NumberProcessing(1);
@@ -555,6 +566,39 @@ void translateir() // takes action based on IR code received // describing Car M
     case 0xD6284F44:
       if (DEBUGLEVEL) Serial.println(" 9 ");
       NumberProcessing(9);
+      break;
+
+    //case 0x4A1EC20F:
+    //  if (DEBUGLEVEL) Serial.println(" TEXT ");
+    //  break;
+      
+    //case 0x189FBEF5:
+    //  if (DEBUGLEVEL) Serial.println(" REC ");
+    //  break;
+      
+    case 0xC1EE7333:
+      if (DEBUGLEVEL) Serial.println(" 0 ");
+      if (isSetPlayer)
+      {
+        iPlayers = 4;           //set 4 default players
+        iCardEach = 13;         //set 13 playing cards for each one as default
+        iPlayerDistance = 90;   //set 90 degrees for players distance
+        iDealCards = 2000;      //dealing one card with 2 seconds
+        isSetPlayer = false;   //will set players number if true
+        isSetCardForEach = false;//will set card for each player if true
+        isDoneSetCardForEach = false;//completed set card for each player if true
+      }
+      else
+      {
+        iPlayers = 4;           //set 4 default players
+        iCardEach = 13;         //set 13 playing cards for each one as default
+        iPlayerDistance = 90;   //set 90 degrees for players distance
+        iDealCards = 2000;      //dealing one card with 2 seconds
+        isSetPlayer = false;   //will set players number if true
+        isSetCardForEach = false;//will set card for each player if true
+        isDoneSetCardForEach = false;//completed set card for each player if true
+        //compass.Turn(EAST);
+      }
       break;
 
     default:
