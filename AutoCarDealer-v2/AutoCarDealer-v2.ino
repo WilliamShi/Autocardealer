@@ -1,499 +1,636 @@
-/*
- * 智能发牌机控制系统
- * 基于Arduino Pro Mini
- * 控制三个HG7881电机，HMC5883L磁力计，红外遥控和LCD1602显示屏
- */
-
+#include <IRremote.hpp>
+#include <LiquidCrystal.h>
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_HMC5883_U.h>
-#include <IRremote.h>
-#include <LiquidCrystal_I2C.h>
 
-// ============== 引脚定义 ==============
-// 电机控制引脚
-#define MOTOR_LEFT_A 2    // 左轮电机A
-#define MOTOR_LEFT_B 3    // 左轮电机B
-#define MOTOR_RIGHT_A 4   // 右轮电机A
-#define MOTOR_RIGHT_B 5   // 右轮电机B
-#define MOTOR_DEAL_A 6    // 发牌电机A
-#define MOTOR_DEAL_B 7    // 发牌电机B
+// ==================== 调试控制 ====================
+#define DEBUG 1  // 启用调试信息
 
-// 红外传感器引脚
-#define IR_SENSOR_PIN 8   // 红外接收头VC1838
-#define IR_DETECT_PIN 9   // 红外检测发牌（普通红外发射接收对管）
+// ==================== 引脚定义 ====================
+#define RECV_PIN 10
+#define OBSTACLE_PIN 7
+#define OBSTACLE_LED 13
 
-// 按钮引脚（可选）
-#define BUTTON_START 10   // 开始按钮
-#define BUTTON_STOP 11    // 停止按钮
+// L9110电机驱动引脚
+#define MOTOR_A_IA 8      // 电机A控制A (平台旋转)
+#define MOTOR_A_IB 9      // 电机A控制B (平台旋转)
+#define MOTOR_B_IA A3     // 电机B控制A (发牌轮)
+#define MOTOR_B_IB A2     // 电机B控制B (发牌轮)
 
-// ============== 全局变量 ==============
-// 参数设置
-int playerCount = 4;      // 玩家人数（默认4人）
-int deckCount = 1;        // 牌副数（默认1副）
-int remainCards = 0;      // 剩余牌数（默认0张）
-int totalCards = 0;       // 总牌数（自动计算）
+// ==================== 模块初始化 ====================
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);  // LCD引脚
 
-// 发牌状态
-bool isDealing = false;   // 是否正在发牌
-int currentPlayer = 0;    // 当前发牌玩家
-int cardsDealt = 0;       // 已发牌数
-int cardsPerPlayer = 0;   // 每人应发牌数
+// ==================== 系统状态 ====================
+enum SystemState {
+  STATE_IDLE,           // 空闲状态
+  STATE_B_RUNNING,      // B电机正在运行，等待避障
+  STATE_B_WAITING,      // B电机等待避障（已启动但未检测到）
+  STATE_A_RUNNING,      // A电机正在运行
+  STATE_B_TIMEOUT       // B电机超时
+};
 
-// 方向控制
-float currentHeading = 0;     // 当前方向
-float targetHeading = 0;      // 目标方向
-float rotationAngle = 90;     // 旋转角度（根据人数计算）
+// ==================== 全局变量 ====================
+// 游戏设置
+uint8_t playerCount = 4;
+uint8_t deckCount = 3;
+uint8_t remainCards = 0;
+uint8_t hasJokers = 1;
 
-// 红外遥控
-IRrecv irrecv(IR_SENSOR_PIN);
-decode_results results;
+// 牌数计算
+uint16_t totalCards = 0;
+uint16_t dealtCards = 0;
 
-// HMC5883L磁力计
-Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+// 系统状态
+SystemState currentState = STATE_IDLE;
+uint8_t isRunning = 0;
 
-// LCD1602显示屏（I2C地址通常是0x27或0x3F）
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+// 时间控制
+unsigned long motorStartTime = 0;
+unsigned long lastObstacleTime = 0;
+unsigned long obstacleDebounce = 0;
+unsigned long lastDebugTime = 0;
 
-// ============== 电机控制函数 ==============
-void setupMotors() {
-  pinMode(MOTOR_LEFT_A, OUTPUT);
-  pinMode(MOTOR_LEFT_B, OUTPUT);
-  pinMode(MOTOR_RIGHT_A, OUTPUT);
-  pinMode(MOTOR_RIGHT_B, OUTPUT);
-  pinMode(MOTOR_DEAL_A, OUTPUT);
-  pinMode(MOTOR_DEAL_B, OUTPUT);
+// 避障状态
+int lastObstacleState = LOW;
+int obstacleState = LOW;
+
+// 调试计数器
+unsigned long bMotorStartCount = 0;
+unsigned long obstacleDetectCount = 0;
+
+// 常量
+const unsigned long MOTOR_A_TIMEOUT = 400;
+const unsigned long MOTOR_B_TIMEOUT = 7000;
+const unsigned long OBSTACLE_DEBOUNCE = 100;
+const unsigned long OBSTACLE_COOLDOWN = 1000;
+const unsigned long DEBUG_INTERVAL = 1000;
+
+// ==================== 函数声明 ====================
+void updateDisplay();
+void checkObstacle();
+void handleIRCommand(IRData* results);
+void controlMotorA(uint8_t direction);
+void controlMotorB(uint8_t state);
+void stopAllMotors();
+void calculateTotalCards();
+void startDealing();
+void stopDealing();
+void updateDealtCards();
+void showStatusMessage(const char* message);
+void handleMotorState();
+void changeState(SystemState newState);
+void debugInfo();
+
+// ==================== SETUP函数 ====================
+void setup() {
+  // 初始化引脚
+  pinMode(MOTOR_A_IA, OUTPUT);
+  pinMode(MOTOR_A_IB, OUTPUT);
+  pinMode(MOTOR_B_IA, OUTPUT);
+  pinMode(MOTOR_B_IB, OUTPUT);
+  pinMode(OBSTACLE_PIN, INPUT);
+  pinMode(OBSTACLE_LED, OUTPUT);
   
+  // 立即停止所有电机
   stopAllMotors();
-}
-
-void stopAllMotors() {
-  digitalWrite(MOTOR_LEFT_A, LOW);
-  digitalWrite(MOTOR_LEFT_B, LOW);
-  digitalWrite(MOTOR_RIGHT_A, LOW);
-  digitalWrite(MOTOR_RIGHT_B, LOW);
-  digitalWrite(MOTOR_DEAL_A, LOW);
-  digitalWrite(MOTOR_DEAL_B, LOW);
-}
-
-void moveForward() {
-  // 两个轮子相反方向旋转，实现底座旋转
-  digitalWrite(MOTOR_LEFT_A, HIGH);
-  digitalWrite(MOTOR_LEFT_B, LOW);
-  digitalWrite(MOTOR_RIGHT_A, LOW);
-  digitalWrite(MOTOR_RIGHT_B, HIGH);
-}
-
-void moveBackward() {
-  digitalWrite(MOTOR_LEFT_A, LOW);
-  digitalWrite(MOTOR_LEFT_B, HIGH);
-  digitalWrite(MOTOR_RIGHT_A, HIGH);
-  digitalWrite(MOTOR_RIGHT_B, LOW);
-}
-
-void stopBase() {
-  digitalWrite(MOTOR_LEFT_A, LOW);
-  digitalWrite(MOTOR_LEFT_B, LOW);
-  digitalWrite(MOTOR_RIGHT_A, LOW);
-  digitalWrite(MOTOR_RIGHT_B, LOW);
-}
-
-void startDealingMotor() {
-  digitalWrite(MOTOR_DEAL_A, HIGH);
-  digitalWrite(MOTOR_DEAL_B, LOW);
-  delay(100); // 启动延迟
-}
-
-void stopDealingMotor() {
-  digitalWrite(MOTOR_DEAL_A, LOW);
-  digitalWrite(MOTOR_DEAL_B, LOW);
-}
-
-// ============== HMC5883L磁力计函数 ==============
-void setupCompass() {
-  if(!mag.begin()) {
-    lcd.setCursor(0, 0);
-    lcd.print("Compass Error!");
-    while(1);
-  }
-}
-
-float getHeading() {
-  sensors_event_t event; 
-  mag.getEvent(&event);
+  digitalWrite(OBSTACLE_LED, LOW);
   
-  // 计算角度（0-360度）
-  float heading = atan2(event.magnetic.y, event.magnetic.x);
-  
-  // 转换为度数
-  heading = heading * 180 / M_PI;
-  
-  // 校正角度到0-360范围
-  if (heading < 0) {
-    heading += 360;
-  }
-  
-  return heading;
-}
-
-void rotateToAngle(float targetAngle) {
-  // 获取当前方向
-  currentHeading = getHeading();
-  
-  // 计算需要旋转的角度（最短路径）
-  float angleDiff = targetAngle - currentHeading;
-  
-  // 处理角度差超过180度的情况
-  if (angleDiff > 180) {
-    angleDiff -= 360;
-  } else if (angleDiff < -180) {
-    angleDiff += 360;
-  }
-  
+  // 初始化LCD
+  lcd.begin(16, 2);
   lcd.clear();
-  lcd.print("Rotating...");
+  lcd.print("Card Dealer v4.3");
   lcd.setCursor(0, 1);
-  lcd.print("Diff: ");
-  lcd.print(angleDiff);
-  lcd.print(" deg");
+  lcd.print("B Motor Fix");
   
-  // 开始旋转
-  if (angleDiff > 0) {
-    // 顺时针旋转
-    moveForward();
-  } else {
-    // 逆时针旋转
-    moveBackward();
-  }
+  // 初始化红外接收
+  IrReceiver.begin(RECV_PIN, ENABLE_LED_FEEDBACK);
   
-  // 监控旋转过程
-  float startTime = millis();
-  while (abs(angleDiff) > 3 && (millis() - startTime < 5000)) { // 3度容差，5秒超时
-    currentHeading = getHeading();
-    angleDiff = targetAngle - currentHeading;
-    
-    // 处理角度差超过180度的情况
-    if (angleDiff > 180) {
-      angleDiff -= 360;
-    } else if (angleDiff < -180) {
-      angleDiff += 360;
-    }
-    
-    delay(50);
-  }
+  // 计算总牌数
+  calculateTotalCards();
   
-  // 停止旋转
-  stopBase();
+  // 初始显示避障状态
+  obstacleState = digitalRead(OBSTACLE_PIN);
+  lastObstacleState = obstacleState;
   
-  lcd.clear();
-  lcd.print("Rotation Done");
-  delay(500);
+  delay(1500);
+  updateDisplay();
 }
 
-// ============== 红外遥控处理函数 ==============
-void setupIR() {
-  irrecv.enableIRIn();
+// ==================== LOOP函数 ====================
+void loop() {
+  // 检查红外遥控信号
+  if (IrReceiver.decode()) {
+    IRData* results = IrReceiver.read();
+    handleIRCommand(results);
+    IrReceiver.resume();
+  }
+  
+  // 检查避障模块
+  checkObstacle();
+  
+  // 处理电机状态
+  if (isRunning) {
+    handleMotorState();
+  }
+  
+  // 调试信息
+  #if DEBUG
+  if (millis() - lastDebugTime > DEBUG_INTERVAL) {
+    debugInfo();
+    lastDebugTime = millis();
+  }
+  #endif
+  
+  delay(10);
 }
 
-void handleIRCommand(unsigned long value) {
-  // 根据红外遥控器按键值处理命令
-  // 注意：这些值需要根据实际遥控器调整
-  switch(value) {
-    case 0xFF6897: // 按键1 - 增加玩家人数
-      playerCount++;
-      if (playerCount > 8) playerCount = 2; // 循环2-8人
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFF9867: // 按键2 - 增加牌副数
-      deckCount++;
-      if (deckCount > 4) deckCount = 1; // 循环1-4副
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFFB04F: // 按键3 - 增加剩余牌数
-      remainCards += 5;
-      if (remainCards > 50) remainCards = 0; // 最大剩余50张
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFF30CF: // 按键4 - 重置玩家人数
-      playerCount = 4;
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFF18E7: // 按键5 - 重置牌副数
-      deckCount = 1;
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFF7A85: // 按键6 - 重置剩余牌数
-      remainCards = 0;
-      calculateParameters();
-      updateDisplay();
-      break;
-      
-    case 0xFF10EF: // 按键0 - 开始发牌
-      if (!isDealing) {
-        startDealing();
+// ==================== 状态处理函数 ====================
+void handleMotorState() {
+  switch (currentState) {
+    case STATE_B_RUNNING:
+      // B电机正在运行
+      // 检查B电机是否超时
+      if (millis() - motorStartTime > MOTOR_B_TIMEOUT) {
+        changeState(STATE_B_TIMEOUT);
+        showStatusMessage("B Timeout!");
+        delay(1000);
+        stopDealing();
       }
       break;
       
-    case 0xFF38C7: // 按键* - 停止/重置
-      stopDealing();
+    case STATE_A_RUNNING:
+      // A电机正在运行
+      // 检查A电机是否超时
+      if (millis() - motorStartTime > MOTOR_A_TIMEOUT) {
+        // A电机超时，切换到B电机
+        stopAllMotors();
+        changeState(STATE_B_RUNNING);
+        motorStartTime = millis();
+        bMotorStartCount++;
+        
+        // 启动B电机
+        controlMotorB(1);
+        showStatusMessage("B Running");
+        
+        #if DEBUG
+        Serial.print("B Motor Started: ");
+        Serial.println(bMotorStartCount);
+        #endif
+      }
       break;
       
-    case 0xFF5AA5: // 按键# - 校准方向
-      calibrateDirection();
+    case STATE_B_TIMEOUT:
+    case STATE_IDLE:
+    default:
+      // 其他状态不处理
       break;
   }
 }
 
-// ============== 参数计算函数 ==============
-void calculateParameters() {
-  // 计算总牌数（假设每副牌54张）
-  totalCards = deckCount * 54 - remainCards;
+// ==================== 避障检测函数 ====================
+void checkObstacle() {
+  // 读取避障传感器状态
+  obstacleState = digitalRead(OBSTACLE_PIN);
   
-  // 计算旋转角度
-  rotationAngle = 360.0 / playerCount;
+  // 只有在B电机运行时才检测避障
+  if (currentState != STATE_B_RUNNING && currentState != STATE_B_WAITING) {
+    lastObstacleState = obstacleState;
+    return;
+  }
   
-  // 计算每人应发牌数
-  cardsPerPlayer = totalCards / playerCount;
+  // 检测状态变化（上升沿检测）
+  if (obstacleState == HIGH && lastObstacleState == LOW) {
+    // 防抖处理
+    if (millis() - obstacleDebounce > OBSTACLE_DEBOUNCE) {
+      obstacleDebounce = millis();
+      
+      // 冷却时间检查
+      if (millis() - lastObstacleTime > OBSTACLE_COOLDOWN) {
+        lastObstacleTime = millis();
+        obstacleDetectCount++;
+        
+        // 只有在B电机运行时才处理避障
+        if (currentState == STATE_B_RUNNING) {
+          // 检测到物体通过
+          
+          // 1. 停止B电机
+          stopAllMotors();
+          
+          // 2. 更新已发牌数
+          dealtCards++;
+          if (dealtCards > totalCards) dealtCards = totalCards;
+          updateDealtCards();
+          
+          // 3. 切换到A电机
+          changeState(STATE_A_RUNNING);
+          motorStartTime = millis();
+          
+          // 4. 启动A电机
+          controlMotorA(1);  // 顺时针转动
+          
+          // 5. LED指示
+          digitalWrite(OBSTACLE_LED, HIGH);
+          delay(50);
+          digitalWrite(OBSTACLE_LED, LOW);
+          
+          showStatusMessage("Card Detected");
+          
+          #if DEBUG
+          Serial.print("Obstacle Detected: ");
+          Serial.println(obstacleDetectCount);
+          #endif
+          
+          // 6. 检查是否所有牌已发完
+          if (dealtCards >= totalCards && totalCards > 0) {
+            stopDealing();
+            showStatusMessage("All Done!");
+            delay(1000);
+            updateDisplay();
+          }
+        }
+      }
+    }
+  }
+  
+  // 更新上次状态
+  lastObstacleState = obstacleState;
 }
 
-// ============== LCD显示函数 ==============
-void setupLCD() {
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  
-  lcd.setCursor(0, 0);
-  lcd.print("Smart Card Dealer");
-  lcd.setCursor(0, 1);
-  lcd.print("Initializing...");
-  delay(2000);
+// ==================== 状态切换函数 ====================
+void changeState(SystemState newState) {
+  currentState = newState;
 }
 
-void updateDisplay() {
-  lcd.clear();
+// ==================== 电机控制函数 ====================
+void controlMotorA(uint8_t direction) {
+  if (direction == 1) {
+    // 顺时针转动
+    digitalWrite(MOTOR_A_IA, HIGH);
+    digitalWrite(MOTOR_A_IB, LOW);
+  } else {
+    // 逆时针转动
+    digitalWrite(MOTOR_A_IA, LOW);
+    digitalWrite(MOTOR_A_IB, HIGH);
+  }
   
-  // 第一行：显示基本参数
-  lcd.setCursor(0, 0);
-  lcd.print("P:");
-  lcd.print(playerCount);
-  lcd.print(" D:");
-  lcd.print(deckCount);
-  lcd.print(" R:");
-  lcd.print(remainCards);
-  
-  // 第二行：显示计算参数
-  lcd.setCursor(0, 1);
-  lcd.print("T:");
-  lcd.print(totalCards);
-  lcd.print(" C:");
-  lcd.print(cardsPerPlayer);
-  lcd.print("/P");
+  #if DEBUG
+  Serial.print("Motor A: ");
+  Serial.println(direction == 1 ? "Forward" : "Reverse");
+  #endif
 }
 
-void showStatus(String message) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(message);
+void controlMotorB(uint8_t state) {
+  if (state) {
+    // 启动B电机
+    digitalWrite(MOTOR_B_IA, HIGH);
+    digitalWrite(MOTOR_B_IB, LOW);
+    #if DEBUG
+    Serial.println("Motor B: ON");
+    #endif
+  } else {
+    // 停止B电机
+    digitalWrite(MOTOR_B_IA, LOW);
+    digitalWrite(MOTOR_B_IB, LOW);
+    #if DEBUG
+    Serial.println("Motor B: OFF");
+    #endif
+  }
 }
 
-// ============== 发牌控制函数 ==============
+void stopAllMotors() {
+  // 停止A电机
+  digitalWrite(MOTOR_A_IA, LOW);
+  digitalWrite(MOTOR_A_IB, LOW);
+  
+  // 停止B电机
+  digitalWrite(MOTOR_B_IA, LOW);
+  digitalWrite(MOTOR_B_IB, LOW);
+  
+  #if DEBUG
+  Serial.println("All Motors Stopped");
+  #endif
+}
+
+// ==================== 游戏控制函数 ====================
 void startDealing() {
-  if (playerCount < 2) {
-    showStatus("Min 2 players");
-    delay(2000);
+  if (totalCards <= 0) {
+    showStatusMessage("No Cards!");
+    delay(1000);
     updateDisplay();
     return;
   }
   
-  calculateParameters();
-  isDealing = true;
-  currentPlayer = 0;
-  cardsDealt = 0;
+  // 重置状态
+  isRunning = 1;
+  dealtCards = 0;
+  bMotorStartCount = 0;
+  obstacleDetectCount = 0;
   
-  showStatus("Starting deal...");
-  delay(1000);
+  // 确保所有电机停止
+  stopAllMotors();
   
-  // 主发牌循环
-  while (cardsDealt < totalCards && isDealing) {
-    // 计算当前玩家的目标角度
-    targetHeading = (currentPlayer * rotationAngle);
-    if (targetHeading >= 360) targetHeading -= 360;
-    
-    // 旋转到底座到目标位置
-    rotateToAngle(targetHeading);
-    
-    // 显示当前发牌状态
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Player ");
-    lcd.print(currentPlayer + 1);
-    lcd.print(" of ");
-    lcd.print(playerCount);
-    lcd.setCursor(0, 1);
-    lcd.print("Card ");
-    lcd.print(cardsDealt + 1);
-    lcd.print(" of ");
-    lcd.print(totalCards);
-    
-    // 发一张牌
-    dealOneCard();
-    
-    // 更新计数
-    cardsDealt++;
-    currentPlayer++;
-    if (currentPlayer >= playerCount) {
-      currentPlayer = 0;
-    }
-    
-    // 检查红外停止信号
-    if (!isDealing) break;
-    
-    // 短暂延迟
-    delay(500);
-  }
+  // 开始从B电机运行
+  changeState(STATE_B_RUNNING);
+  motorStartTime = millis();
   
-  if (cardsDealt >= totalCards) {
-    showStatus("Dealing complete!");
-    delay(3000);
-  }
+  // 启动B电机
+  controlMotorB(1);
+  bMotorStartCount++;
   
-  updateDisplay();
-  isDealing = false;
-}
-
-void dealOneCard() {
-  // 启动发牌电机
-  startDealingMotor();
+  // 显示开始信息
+  showStatusMessage("Start Dealing");
   
-  // 等待红外传感器检测到牌
-  bool cardDetected = false;
-  unsigned long startTime = millis();
+  #if DEBUG
+  Serial.println("=== Start Dealing ===");
+  Serial.print("Total Cards: ");
+  Serial.println(totalCards);
+  #endif
   
-  while (!cardDetected && (millis() - startTime < 5000)) { // 5秒超时
-    if (digitalRead(IR_DETECT_PIN) == LOW) { // 假设有牌时输出低电平
-      cardDetected = true;
-    }
-    
-    // 检查停止信号
-    if (!isDealing) break;
-    
-    delay(10);
-  }
-  
-  // 停止发牌电机
-  stopDealingMotor();
-  
-  if (!cardDetected) {
-    showStatus("Card jam error!");
-    delay(2000);
-    isDealing = false;
-  }
-  
-  // 短暂延迟，确保牌完全离开
-  delay(300);
+  delay(500);
 }
 
 void stopDealing() {
-  isDealing = false;
+  isRunning = 0;
+  changeState(STATE_IDLE);
   stopAllMotors();
-  showStatus("Stopped");
-  delay(1000);
+  
+  // 更新显示
   updateDisplay();
+  
+  #if DEBUG
+  Serial.println("=== Stop Dealing ===");
+  Serial.print("B Motor Start Count: ");
+  Serial.println(bMotorStartCount);
+  Serial.print("Obstacle Detect Count: ");
+  Serial.println(obstacleDetectCount);
+  Serial.print("Cards Dealt: ");
+  Serial.println(dealtCards);
+  #endif
 }
 
-void calibrateDirection() {
-  showStatus("Calibrating...");
-  delay(1000);
+void calculateTotalCards() {
+  uint8_t cardsPerDeck = hasJokers ? 54 : 52;
+  totalCards = deckCount * cardsPerDeck;
   
-  // 获取当前方向作为参考
-  currentHeading = getHeading();
+  if (remainCards > 0 && totalCards > remainCards) {
+    totalCards -= remainCards;
+  }
   
-  showStatus("Calibration OK");
+  if (!isRunning) {
+    dealtCards = 0;
+  }
+}
+
+// ==================== 显示函数 ====================
+void updateDisplay() {
+  lcd.clear();
+  
+  // 第一行: 设置信息
+  lcd.setCursor(0, 0);
+  lcd.print("P");
+  lcd.print(playerCount);
+  lcd.print(" D");
+  lcd.print(deckCount);
+  lcd.print(" ");
+  lcd.print(hasJokers ? "Y" : "N");
+  lcd.print(" ");
+  
+  // 显示已发牌数
+  updateDealtCards();
+  
+  // 第二行: 牌数信息和状态
   lcd.setCursor(0, 1);
-  lcd.print("Ref: ");
-  lcd.print(currentHeading);
-  lcd.print(" deg");
+  lcd.print("T:");
+  lcd.print(totalCards);
+  lcd.print(" D:");
+  lcd.print(dealtCards);
+  lcd.print(" ");
   
-  delay(2000);
-  updateDisplay();
-}
-
-// ============== 初始化函数 ==============
-void setup() {
-  // 初始化串口（调试用）
-  Serial.begin(9600);
-  
-  // 初始化各模块
-  setupLCD();
-  setupMotors();
-  setupCompass();
-  setupIR();
-  
-  // 设置红外检测引脚
-  pinMode(IR_DETECT_PIN, INPUT_PULLUP);
-  
-  // 设置按钮引脚（可选）
-  pinMode(BUTTON_START, INPUT_PULLUP);
-  pinMode(BUTTON_STOP, INPUT_PULLUP);
-  
-  // 计算初始参数
-  calculateParameters();
-  
-  // 显示初始状态
-  updateDisplay();
-  
-  // 显示欢迎信息
-  showStatus("Ready for setup");
-  delay(2000);
-  updateDisplay();
-}
-
-// ============== 主循环 ==============
-void loop() {
-  // 处理红外遥控信号
-  if (irrecv.decode(&results)) {
-    Serial.println(results.value, HEX); // 调试：打印红外码值
-    handleIRCommand(results.value);
-    irrecv.resume(); // 接收下一个信号
-  }
-  
-  // 检查按钮输入（可选）
-  if (digitalRead(BUTTON_START) == LOW && !isDealing) {
-    delay(50); // 防抖
-    if (digitalRead(BUTTON_START) == LOW) {
-      startDealing();
+  // 显示运行状态
+  if (isRunning) {
+    switch (currentState) {
+      case STATE_B_RUNNING:
+        lcd.print("B-RUN");
+        break;
+      case STATE_A_RUNNING:
+        lcd.print("A-RUN");
+        break;
+      case STATE_B_TIMEOUT:
+        lcd.print("B-TO");
+        break;
+      default:
+        lcd.print("RUN");
     }
+  } else {
+    lcd.print("STOP");
   }
   
-  if (digitalRead(BUTTON_STOP) == LOW && isDealing) {
-    delay(50); // 防抖
-    if (digitalRead(BUTTON_STOP) == LOW) {
+  // 显示避障状态
+  lcd.setCursor(15, 1);
+  lcd.print(obstacleState == HIGH ? "H" : "L");
+}
+
+void updateDealtCards() {
+  lcd.setCursor(10, 0);
+  lcd.print("D:");
+  
+  // 格式化显示已发牌数
+  if (dealtCards < 10) {
+    lcd.print("000");
+    lcd.print(dealtCards);
+  } else if (dealtCards < 100) {
+    lcd.print("00");
+    lcd.print(dealtCards);
+  } else if (dealtCards < 1000) {
+    lcd.print("0");
+    lcd.print(dealtCards);
+  } else {
+    lcd.print(dealtCards);
+  }
+}
+
+void showStatusMessage(const char* message) {
+  lcd.clear();
+  
+  // 显示消息
+  lcd.print(message);
+  
+  // 在第二行显示进度
+  lcd.setCursor(0, 1);
+  lcd.print("D:");
+  lcd.print(dealtCards);
+  lcd.print("/");
+  lcd.print(totalCards);
+  
+  // 短暂延迟以确保消息可见
+  delay(300);
+}
+
+// ==================== 调试函数 ====================
+void debugInfo() {
+  #if DEBUG
+  // 初始化串口
+  static bool serialInitialized = false;
+  if (!serialInitialized) {
+    Serial.begin(9600);
+    serialInitialized = true;
+  }
+  
+  Serial.println("=== Debug Info ===");
+  Serial.print("State: ");
+  switch (currentState) {
+    case STATE_IDLE: Serial.println("IDLE"); break;
+    case STATE_B_RUNNING: Serial.println("B_RUNNING"); break;
+    case STATE_A_RUNNING: Serial.println("A_RUNNING"); break;
+    case STATE_B_TIMEOUT: Serial.println("B_TIMEOUT"); break;
+    default: Serial.println("UNKNOWN");
+  }
+  
+  Serial.print("Obstacle: ");
+  Serial.println(obstacleState == HIGH ? "HIGH" : "LOW");
+  
+  Serial.print("B Motor Runs: ");
+  Serial.println(bMotorStartCount);
+  
+  Serial.print("Obstacle Detects: ");
+  Serial.println(obstacleDetectCount);
+  
+  Serial.print("Cards Dealt: ");
+  Serial.print(dealtCards);
+  Serial.print("/");
+  Serial.println(totalCards);
+  
+  if (isRunning) {
+    unsigned long elapsed = millis() - motorStartTime;
+    Serial.print("Motor Running Time: ");
+    Serial.print(elapsed);
+    Serial.println(" ms");
+  }
+  
+  Serial.println();
+  #endif
+}
+
+// ==================== 红外命令处理函数 ====================
+void handleIRCommand(IRData* results) {
+  // 在LCD第二行显示红外代码
+  lcd.setCursor(12, 1);
+  if (results->command < 0x10) lcd.print("0");
+  lcd.print(results->command, HEX);
+  
+  // 根据红外命令执行相应操作
+  switch(results->command) {
+    case 0xDC:  // POWR: 显示欢迎信息
+      lcd.clear();
+      lcd.print("Card Dealer v4.3");
+      lcd.setCursor(0, 1);
+      lcd.print("Debug Mode");
+      delay(2000);
+      updateDisplay();
+      break;
+      
+    case 0x99:  // LEFT: 设置玩家人数
+      playerCount++;
+      if (playerCount > 8) playerCount = 2;
+      calculateTotalCards();
+      updateDisplay();
+      break;
+      
+    case 0xC1:  // RIGHT: 设置牌副数
+      deckCount++;
+      if (deckCount > 3) deckCount = 1;
+      calculateTotalCards();
+      updateDisplay();
+      break;
+      
+    case 0xCA:  // UP: 是否带王
+      hasJokers = !hasJokers;
+      calculateTotalCards();
+      updateDisplay();
+      break;
+      
+    case 0xD2:  // DOWN: 设置剩余牌数
+      remainCards += playerCount;
+      if (remainCards > playerCount * 4) remainCards = 0;
+      calculateTotalCards();
+      updateDisplay();
+      break;
+      
+    case 0xCE:  // OK: 开始发牌
+      if (!isRunning) {
+        startDealing();
+      }
+      break;
+      
+    case 0xC5:  // RETURN: 恢复默认值
+      playerCount = 4;
+      deckCount = 3;
+      hasJokers = 1;
+      remainCards = 0;
       stopDealing();
-    }
+      calculateTotalCards();
+      updateDisplay();
+      break;
+      
+    case 0x88:  // HOME: 测试避障模块
+      {
+        lcd.clear();
+        lcd.print("Test Obstacle");
+        lcd.setCursor(0, 1);
+        
+        int testState = digitalRead(OBSTACLE_PIN);
+        if (testState == HIGH) {
+          lcd.print("HIGH - Blocked");
+        } else {
+          lcd.print("LOW - Clear");
+        }
+        delay(2000);
+        updateDisplay();
+      }
+      break;
+      
+    case 0x82:  // MENU: 停止所有电机
+      if (isRunning) {
+        stopDealing();
+        showStatusMessage("Stopped");
+        delay(1000);
+        updateDisplay();
+      } else {
+        stopAllMotors();
+        changeState(STATE_IDLE);
+        showStatusMessage("Force Stop");
+        delay(1000);
+        updateDisplay();
+      }
+      break;
+      
+    case 0x81:  // VMINUS: A顺时针转测试
+      if (!isRunning) {
+        controlMotorA(1);
+        showStatusMessage("A+ Test");
+        delay(1000);
+        stopAllMotors();
+        updateDisplay();
+      }
+      break;
+      
+    case 0x80:  // VPLUS: A逆时针转测试
+      if (!isRunning) {
+        controlMotorA(0);
+        showStatusMessage("A- Test");
+        delay(1000);
+        stopAllMotors();
+        updateDisplay();
+      }
+      break;
+      
+    case 0x98:  // B: B电机测试
+      if (!isRunning) {
+        controlMotorB(1);
+        showStatusMessage("B Test");
+        delay(2000);
+        stopAllMotors();
+        updateDisplay();
+      }
+      break;
   }
-  
-  // 如果正在发牌，更新状态显示
-  if (isDealing && (millis() % 1000 < 50)) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Dealing: ");
-    lcd.print(cardsDealt);
-    lcd.print("/");
-    lcd.print(totalCards);
-    lcd.setCursor(0, 1);
-    lcd.print("Player ");
-    lcd.print(currentPlayer + 1);
-  }
-  
-  delay(50); // 主循环延迟
 }
