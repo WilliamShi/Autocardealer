@@ -11,7 +11,7 @@
 #define OBSTACLE_LED 13
 
 // L9110电机驱动引脚
-#define MOTOR_A_IA 8      // 电机A控制A (平台旋转)
+#define MOTOR_A_IA 8      // 电机A控制A (平台旋转)  
 #define MOTOR_A_IB 9      // 电机A控制B (平台旋转)
 #define MOTOR_B_IA A3     // 电机B控制A (发牌轮)
 #define MOTOR_B_IB A2     // 电机B控制B (发牌轮)
@@ -23,7 +23,6 @@ LiquidCrystal lcd(12, 11, 5, 4, 3, 2);  // LCD引脚
 enum SystemState {
   STATE_IDLE,           // 空闲状态
   STATE_B_RUNNING,      // B电机正在运行，等待避障
-  STATE_B_WAITING,      // B电机等待避障（已启动但未检测到）
   STATE_A_RUNNING,      // A电机正在运行
   STATE_B_TIMEOUT       // B电机超时
 };
@@ -50,8 +49,10 @@ unsigned long obstacleDebounce = 0;
 unsigned long lastDebugTime = 0;
 
 // 避障状态
-int lastObstacleState = LOW;
-int obstacleState = LOW;
+int lastObstacleState = HIGH;  // 初始化为高电平
+int obstacleState = HIGH;
+bool obstacleActive = false;    // 当前是否有障碍物
+bool obstacleTriggered = false; // 是否已经触发过一次
 
 // 调试计数器
 unsigned long bMotorStartCount = 0;
@@ -60,9 +61,10 @@ unsigned long obstacleDetectCount = 0;
 // 常量
 const unsigned long MOTOR_A_TIMEOUT = 400;
 const unsigned long MOTOR_B_TIMEOUT = 7000;
-const unsigned long OBSTACLE_DEBOUNCE = 100;
-const unsigned long OBSTACLE_COOLDOWN = 1000;
+const unsigned long OBSTACLE_DEBOUNCE = 50;    // 防抖时间
+const unsigned long OBSTACLE_COOLDOWN = 500;   // 冷却时间
 const unsigned long DEBUG_INTERVAL = 1000;
+const unsigned long OBSTACLE_RESET_TIME = 1000; // 障碍物消失后重置时间
 
 // ==================== 函数声明 ====================
 void updateDisplay();
@@ -87,7 +89,10 @@ void setup() {
   pinMode(MOTOR_A_IB, OUTPUT);
   pinMode(MOTOR_B_IA, OUTPUT);
   pinMode(MOTOR_B_IB, OUTPUT);
-  pinMode(OBSTACLE_PIN, INPUT);
+  
+  // 重要：红外避障模块引脚设置为输入模式（不使用上拉）
+  pinMode(OBSTACLE_PIN, INPUT);  // 模块自身应该输出高电平
+  
   pinMode(OBSTACLE_LED, OUTPUT);
   
   // 立即停止所有电机
@@ -97,9 +102,9 @@ void setup() {
   // 初始化LCD
   lcd.begin(16, 2);
   lcd.clear();
-  lcd.print("Card Dealer v4.3");
+  lcd.print("Card Dealer v4.5");
   lcd.setCursor(0, 1);
-  lcd.print("B Motor Fix");
+  lcd.print("IR Module Test");
   
   // 初始化红外接收
   IrReceiver.begin(RECV_PIN, ENABLE_LED_FEEDBACK);
@@ -107,9 +112,29 @@ void setup() {
   // 计算总牌数
   calculateTotalCards();
   
-  // 初始显示避障状态
+  // 初始读取避障状态并等待稳定
+  delay(100);  // 等待模块稳定
   obstacleState = digitalRead(OBSTACLE_PIN);
   lastObstacleState = obstacleState;
+  
+  #if DEBUG
+  Serial.begin(9600);
+  Serial.println("=== System Initialized ===");
+  Serial.print("Obstacle Pin Mode: INPUT (no pullup)");
+  Serial.print("Initial Obstacle State: ");
+  Serial.println(obstacleState == HIGH ? "HIGH" : "LOW");
+  
+  // 测试读取几次
+  Serial.println("Testing obstacle readings:");
+  for (int i = 0; i < 5; i++) {
+    int testRead = digitalRead(OBSTACLE_PIN);
+    Serial.print("Read ");
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(testRead == HIGH ? "HIGH" : "LOW");
+    delay(100);
+  }
+  #endif
   
   delay(1500);
   updateDisplay();
@@ -169,10 +194,9 @@ void handleMotorState() {
         
         // 启动B电机
         controlMotorB(1);
-        showStatusMessage("B Running");
         
         #if DEBUG
-        Serial.print("B Motor Started: ");
+        Serial.print("B Motor Started (after A timeout): ");
         Serial.println(bMotorStartCount);
         #endif
       }
@@ -189,74 +213,150 @@ void handleMotorState() {
 // ==================== 避障检测函数 ====================
 void checkObstacle() {
   // 读取避障传感器状态
-  obstacleState = digitalRead(OBSTACLE_PIN);
+  int newState = digitalRead(OBSTACLE_PIN);
+  
+  // 更新LED显示当前状态（反向显示，低电平时LED亮）
+  digitalWrite(OBSTACLE_LED, newState == LOW ? HIGH : LOW);
   
   // 只有在B电机运行时才检测避障
-  if (currentState != STATE_B_RUNNING && currentState != STATE_B_WAITING) {
-    lastObstacleState = obstacleState;
+  if (currentState != STATE_B_RUNNING) {
+    lastObstacleState = newState;
+    obstacleState = newState;
+    obstacleActive = false;
+    obstacleTriggered = false;
     return;
   }
   
-  // 检测状态变化（上升沿检测）
-  if (obstacleState == HIGH && lastObstacleState == LOW) {
-    // 防抖处理
-    if (millis() - obstacleDebounce > OBSTACLE_DEBOUNCE) {
-      obstacleDebounce = millis();
+  // 状态变化检测
+  if (newState != lastObstacleState) {
+    // 状态发生变化，重置防抖计时器
+    obstacleDebounce = millis();
+    
+    #if DEBUG
+    Serial.print("Obstacle state changed from ");
+    Serial.print(lastObstacleState == HIGH ? "HIGH" : "LOW");
+    Serial.print(" to ");
+    Serial.print(newState == HIGH ? "HIGH" : "LOW");
+    Serial.print(" at ");
+    Serial.println(millis());
+    #endif
+  }
+  
+  // 防抖处理：状态稳定一段时间后才处理
+  if (millis() - obstacleDebounce > OBSTACLE_DEBOUNCE) {
+    // 状态已经稳定
+    if (newState != obstacleState) {
+      // 更新当前状态
+      obstacleState = newState;
       
-      // 冷却时间检查
-      if (millis() - lastObstacleTime > OBSTACLE_COOLDOWN) {
-        lastObstacleTime = millis();
-        obstacleDetectCount++;
+      #if DEBUG
+      Serial.print("Obstacle state stabilized to: ");
+      Serial.println(obstacleState == HIGH ? "HIGH" : "LOW");
+      #endif
+    }
+    
+    // 根据稳定后的状态处理
+    if (obstacleState == LOW) {
+      // 检测到低电平（有物体）
+      if (!obstacleActive) {
+        obstacleActive = true;
+        #if DEBUG
+        Serial.println("Obstacle detected (LOW)");
+        #endif
+      }
+      
+      // 如果之前没有触发过，且冷却时间已过，则触发动作
+      if (!obstacleTriggered && (millis() - lastObstacleTime > OBSTACLE_COOLDOWN)) {
+        // 触发避障事件
+        handleObstacleEvent();
+      }
+    } else {
+      // 高电平（无障碍物）
+      if (obstacleActive) {
+        obstacleActive = false;
+        obstacleTriggered = false; // 重置触发标志，允许下次检测
         
-        // 只有在B电机运行时才处理避障
-        if (currentState == STATE_B_RUNNING) {
-          // 检测到物体通过
-          
-          // 1. 停止B电机
-          stopAllMotors();
-          
-          // 2. 更新已发牌数
-          dealtCards++;
-          if (dealtCards > totalCards) dealtCards = totalCards;
-          updateDealtCards();
-          
-          // 3. 切换到A电机
-          changeState(STATE_A_RUNNING);
-          motorStartTime = millis();
-          
-          // 4. 启动A电机
-          controlMotorA(1);  // 顺时针转动
-          
-          // 5. LED指示
-          digitalWrite(OBSTACLE_LED, HIGH);
-          delay(50);
-          digitalWrite(OBSTACLE_LED, LOW);
-          
-          showStatusMessage("Card Detected");
-          
-          #if DEBUG
-          Serial.print("Obstacle Detected: ");
-          Serial.println(obstacleDetectCount);
-          #endif
-          
-          // 6. 检查是否所有牌已发完
-          if (dealtCards >= totalCards && totalCards > 0) {
-            stopDealing();
-            showStatusMessage("All Done!");
-            delay(1000);
-            updateDisplay();
-          }
-        }
+        #if DEBUG
+        Serial.println("Obstacle cleared (HIGH)");
+        #endif
       }
     }
   }
   
   // 更新上次状态
-  lastObstacleState = obstacleState;
+  lastObstacleState = newState;
+}
+
+// 处理避障事件
+void handleObstacleEvent() {
+  // 记录触发时间
+  lastObstacleTime = millis();
+  obstacleTriggered = true;
+  obstacleDetectCount++;
+  
+  // 检测到物体通过
+  #if DEBUG
+  Serial.print("=== Obstacle Event #");
+  Serial.print(obstacleDetectCount);
+  Serial.print(" at ");
+  Serial.println(millis());
+  #endif
+  
+  // 1. 停止B电机
+  stopAllMotors();
+  
+  // 2. 更新已发牌数
+  dealtCards++;
+  if (dealtCards > totalCards) dealtCards = totalCards;
+  updateDealtCards();
+  
+  // 3. 切换到A电机
+  changeState(STATE_A_RUNNING);
+  motorStartTime = millis();
+  
+  // 4. 启动A电机
+  controlMotorA(1);  // 顺时针转动
+  
+  // 短暂闪烁LED
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(OBSTACLE_LED, HIGH);
+    delay(50);
+    digitalWrite(OBSTACLE_LED, LOW);
+    delay(50);
+  }
+  
+  showStatusMessage("Card Detected");
+  
+  #if DEBUG
+  Serial.print("Card detected, switching to A motor. Cards dealt: ");
+  Serial.println(dealtCards);
+  #endif
+  
+  // 5. 检查是否所有牌已发完
+  if (dealtCards >= totalCards && totalCards > 0) {
+    stopDealing();
+    showStatusMessage("All Done!");
+    delay(1000);
+    updateDisplay();
+  }
 }
 
 // ==================== 状态切换函数 ====================
 void changeState(SystemState newState) {
+  #if DEBUG
+  const char* stateNames[] = {"IDLE", "B_RUNNING", "A_RUNNING", "B_TIMEOUT"};
+  Serial.print("State Change: ");
+  Serial.print(stateNames[currentState]);
+  Serial.print(" -> ");
+  Serial.println(stateNames[newState]);
+  #endif
+  
+  // 重置避障相关状态
+  if (newState != STATE_B_RUNNING) {
+    obstacleTriggered = false;
+    obstacleActive = false;
+  }
+  
   currentState = newState;
 }
 
@@ -273,8 +373,12 @@ void controlMotorA(uint8_t direction) {
   }
   
   #if DEBUG
-  Serial.print("Motor A: ");
-  Serial.println(direction == 1 ? "Forward" : "Reverse");
+  static uint8_t lastDirection = 0;
+  if (lastDirection != direction) {
+    Serial.print("Motor A: ");
+    Serial.println(direction == 1 ? "Clockwise" : "Counter-Clockwise");
+    lastDirection = direction;
+  }
   #endif
 }
 
@@ -306,7 +410,11 @@ void stopAllMotors() {
   digitalWrite(MOTOR_B_IB, LOW);
   
   #if DEBUG
-  Serial.println("All Motors Stopped");
+  static unsigned long lastStopPrint = 0;
+  if (millis() - lastStopPrint > 1000) {
+    Serial.println("All Motors Stopped");
+    lastStopPrint = millis();
+  }
   #endif
 }
 
@@ -324,6 +432,8 @@ void startDealing() {
   dealtCards = 0;
   bMotorStartCount = 0;
   obstacleDetectCount = 0;
+  obstacleActive = false;
+  obstacleTriggered = false;
   
   // 确保所有电机停止
   stopAllMotors();
@@ -340,9 +450,13 @@ void startDealing() {
   showStatusMessage("Start Dealing");
   
   #if DEBUG
-  Serial.println("=== Start Dealing ===");
+  Serial.println("\n=== Start Dealing ===");
   Serial.print("Total Cards: ");
   Serial.println(totalCards);
+  Serial.print("Players: ");
+  Serial.println(playerCount);
+  Serial.print("B motor started at: ");
+  Serial.println(millis());
   #endif
   
   delay(500);
@@ -468,13 +582,6 @@ void showStatusMessage(const char* message) {
 // ==================== 调试函数 ====================
 void debugInfo() {
   #if DEBUG
-  // 初始化串口
-  static bool serialInitialized = false;
-  if (!serialInitialized) {
-    Serial.begin(9600);
-    serialInitialized = true;
-  }
-  
   Serial.println("=== Debug Info ===");
   Serial.print("State: ");
   switch (currentState) {
@@ -485,8 +592,13 @@ void debugInfo() {
     default: Serial.println("UNKNOWN");
   }
   
-  Serial.print("Obstacle: ");
-  Serial.println(obstacleState == HIGH ? "HIGH" : "LOW");
+  Serial.print("Obstacle State: ");
+  Serial.print(obstacleState == HIGH ? "HIGH" : "LOW");
+  Serial.print(" (Active: ");
+  Serial.print(obstacleActive ? "Yes" : "No");
+  Serial.print(", Triggered: ");
+  Serial.print(obstacleTriggered ? "Yes" : "No");
+  Serial.println(")");
   
   Serial.print("B Motor Runs: ");
   Serial.println(bMotorStartCount);
@@ -504,6 +616,12 @@ void debugInfo() {
     Serial.print("Motor Running Time: ");
     Serial.print(elapsed);
     Serial.println(" ms");
+    
+    if (currentState == STATE_B_RUNNING) {
+      Serial.print("Time until B timeout: ");
+      Serial.print(MOTOR_B_TIMEOUT - elapsed);
+      Serial.println(" ms");
+    }
   }
   
   Serial.println();
@@ -521,9 +639,9 @@ void handleIRCommand(IRData* results) {
   switch(results->command) {
     case 0xDC:  // POWR: 显示欢迎信息
       lcd.clear();
-      lcd.print("Card Dealer v4.3");
+      lcd.print("Card Dealer v4.5");
       lcd.setCursor(0, 1);
-      lcd.print("Debug Mode");
+      lcd.print("IR Module Test");
       delay(2000);
       updateDisplay();
       break;
@@ -577,12 +695,33 @@ void handleIRCommand(IRData* results) {
         lcd.print("Test Obstacle");
         lcd.setCursor(0, 1);
         
-        int testState = digitalRead(OBSTACLE_PIN);
-        if (testState == HIGH) {
-          lcd.print("HIGH - Blocked");
-        } else {
-          lcd.print("LOW - Clear");
+        // 连续读取多次以获得准确状态
+        int highCount = 0;
+        int lowCount = 0;
+        
+        for (int i = 0; i < 20; i++) {
+          int testState = digitalRead(OBSTACLE_PIN);
+          if (testState == HIGH) {
+            highCount++;
+          } else {
+            lowCount++;
+          }
+          delay(10);
         }
+        
+        if (highCount > lowCount) {
+          lcd.print("HIGH - Clear");
+        } else {
+          lcd.print("LOW - Blocked");
+        }
+        
+        #if DEBUG
+        Serial.print("Obstacle test - High: ");
+        Serial.print(highCount);
+        Serial.print(", Low: ");
+        Serial.println(lowCount);
+        #endif
+        
         delay(2000);
         updateDisplay();
       }
