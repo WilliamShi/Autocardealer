@@ -10,7 +10,7 @@ float anglePerPlayer = 90.0;  // 每个玩家之间的角度间隔，初始为4�
 #include "QMC5883L.h"  // 使用您的库文件
 
 // ==================== 输入控制宏 ====================
-#define ENABLE_INFRA 1        // 启用红外输入
+#define ENABLE_INFRA 0        // 启用红外输入
 #define ENABLE_KEYBOARD 1     // 启用键盘（串口）输入
 
 #if ENABLE_INFRA
@@ -113,6 +113,45 @@ int serialBufferIndex = 0;
 unsigned long lastSerialCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 100;  // 串口输入超时时间
 
+// ==================== 新增：QMC5883L硬件复位函数 ====================
+void hardwareResetQMC5883L() {
+  #if DEBUG
+  Serial.println(F("Performing hardware reset of QMC5883L..."));
+  #endif
+  
+  // QMC5883L软复位：向控制寄存器2（0x0B）写入0x80
+  Wire.beginTransmission(0x0D);
+  Wire.write(0x0B);  // 控制寄存器2地址
+  Wire.write(0x80);  // 软复位命令
+  Wire.endTransmission();
+  
+  delay(50);  // 等待复位完成
+  
+  // 再次确认复位
+  Wire.beginTransmission(0x0D);
+  Wire.write(0x0B);
+  Wire.write(0x01);  // 设置为连续测量模式
+  Wire.endTransmission();
+  
+  delay(100);  // 等待传感器稳定
+}
+
+// ==================== 改进的I2C初始化 ====================
+void resetI2C() {
+  // 重置I2C总线
+  Wire.end();
+  delay(50);
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, INPUT_PULLUP);
+  delay(50);
+  Wire.begin();
+  delay(200);  // 延长等待时间
+  
+  #if DEBUG
+  Serial.println(F("I2C bus reset complete"));
+  #endif
+}
+
 // ==================== 电机控制函数 ====================
 void stopAllMotors() {
   digitalWrite(MOTOR_A_IA, LOW);
@@ -137,7 +176,7 @@ void controlMotorA(bool enable) {
 
 void controlMotorB(uint8_t state) {
   if (state) {
-    analogWrite(MOTOR_B_IA, 255);  // 中等速度
+    analogWrite(MOTOR_B_IA, 200);  // 中等速度
     digitalWrite(MOTOR_B_IB, LOW);
   } else {
     digitalWrite(MOTOR_B_IA, LOW);
@@ -193,36 +232,32 @@ void calculateMotorATimeout() {
   #endif
 }
 
-// ==================== 修正的罗盘读取函数 ====================
+// ==================== 简化的罗盘读取函数 ====================
 bool readCompassHeading(float &heading) {
   if (!compassInitialized) {
     return false;
   }
   
-  // 检查罗盘是否就绪
+  // 使用库的ready()函数检查数据就绪
   if (!compass.ready()) {
-    #if DEBUG
-    static unsigned long lastNotReadyTime = 0;
-    if (millis() - lastNotReadyTime > 2000) {
-      Serial.println(F("Compass not ready"));
-      lastNotReadyTime = millis();
+    // 等待一小段时间（最多50ms）
+    for (int i = 0; i < 5; i++) {
+      delay(10);
+      if (compass.ready()) break;
     }
-    #endif
-    return false;
+    
+    if (!compass.ready()) {
+      return false;
+    }
   }
   
-  int maxAttempts = 3;
+  // 读取航向（库会自动进行校准）
+  int rawHeading = compass.readHeading();
   
-  for (int attempt = 0; attempt < maxAttempts; attempt++) {
-    int rawHeading = compass.readHeading();
-    
-    if (rawHeading >= 0 && rawHeading <= 360) {
-      float correctedHeading = normalizeAngle(rawHeading + MAGNETIC_DECLINATION);
-      heading = correctedHeading;
-      return true;
-    }
-    
-    delay(10);
+  if (rawHeading >= 0 && rawHeading <= 360) {
+    // 应用磁偏角修正
+    heading = normalizeAngle(rawHeading + MAGNETIC_DECLINATION);
+    return true;
   }
   
   return false;
@@ -310,41 +345,97 @@ float getCurrentHeading() {
   }
 }
 
-// ==================== 修正的罗盘初始化 - 针对您的库 ====================
+// ==================== 新增：罗盘恢复函数 ====================
+void recoverCompass() {
+  #if DEBUG
+  Serial.println(F("Attempting compass recovery..."));
+  #endif
+  
+  lcd.clear();
+  lcd.print(F("Recovering"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Compass..."));
+  
+  // 1. 停止所有电机（减少电磁干扰）
+  stopAllMotors();
+  delay(100);
+  
+  // 2. 重置I2C总线
+  resetI2C();
+  
+  // 3. 硬件复位传感器
+  hardwareResetQMC5883L();
+  
+  // 4. 重新初始化罗盘
+  bool success = initCompass();
+  
+  if (success) {
+    // 5. 重新校准
+    calibrateCompass();
+    
+    #if DEBUG
+    Serial.println(F("Compass recovery successful"));
+    #endif
+    
+    lcd.clear();
+    lcd.print(F("Recovery OK"));
+    delay(1000);
+  } else {
+    #if DEBUG
+    Serial.println(F("Compass recovery failed"));
+    #endif
+    
+    lcd.clear();
+    lcd.print(F("Recovery Failed"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Using Timeout"));
+    delay(1000);
+  }
+}
+
+// ==================== 完全重构的罗盘初始化 ====================
 bool initCompass() {
   #if DEBUG
-  Serial.println(F("Initializing compass (custom library)..."));
+  Serial.println(F("=== COMPASS INITIALIZATION ==="));
+  Serial.println(F("Using QMC5883L library with auto-calibration"));
   #endif
   
   lcd.clear();
   lcd.print(F("Init Compass..."));
   
-  // 1. 初始化I2C总线
-  Wire.begin();
-  delay(100);
+  // 1. 重置I2C总线 - 确保从干净状态开始
+  resetI2C();
   
-  // 2. 尝试检测I2C设备
+  // 2. 尝试硬件复位QMC5883L（针对软复位后的问题）
+  hardwareResetQMC5883L();
+  
+  // 3. 检查I2C设备是否存在
+  #if DEBUG
+  Serial.println(F("1. Checking I2C device..."));
+  #endif
+  
   Wire.beginTransmission(0x0D);
   byte error = Wire.endTransmission();
   
   if (error != 0) {
     #if DEBUG
-    Serial.print(F("I2C device not found at 0x0D, error code: "));
-    Serial.println(error);
+    Serial.print(F("I2C device not found at 0x0D (error: "));
+    Serial.print(error);
+    Serial.println(F(")"));
+    Serial.println(F("Trying alternative addresses..."));
     #endif
     
     // 尝试其他可能的地址
-    const byte possibleAddresses[] = {0x0D, 0x1E, 0x1F, 0x0C};
+    byte addresses[] = {0x0C, 0x1E, 0x1F};
     bool found = false;
     
-    for (byte i = 0; i < sizeof(possibleAddresses); i++) {
-      Wire.beginTransmission(possibleAddresses[i]);
+    for (byte i = 0; i < sizeof(addresses); i++) {
+      Wire.beginTransmission(addresses[i]);
       error = Wire.endTransmission();
       if (error == 0) {
         #if DEBUG
         Serial.print(F("Found device at 0x"));
-        if (possibleAddresses[i] < 16) Serial.print("0");
-        Serial.println(possibleAddresses[i], HEX);
+        Serial.println(addresses[i], HEX);
         #endif
         found = true;
         break;
@@ -362,120 +453,264 @@ bool initCompass() {
       delay(2000);
       return false;
     }
+  } else {
+    #if DEBUG
+    Serial.println(F("I2C device found at 0x0D"));
+    #endif
   }
   
-  // 3. 初始化罗盘库
+  // 4. 初始化罗盘对象 - 使用新实例避免内存残留问题
+  static QMC5883L newCompass;  // 使用静态确保每次都是新实例
+  compass = newCompass;        // 赋值给全局变量
+  
+  #if DEBUG
+  Serial.println(F("2. Initializing QMC5883L..."));
+  #endif
+  
+  // 重要：先调用init()，它会调用reset()进行默认配置
   compass.init();
   
-  // 4. 配置罗盘参数
-  compass.setSamplingRate(50);    // 50Hz采样率
-  compass.setRange(2);            // 2高斯量程
-  compass.setOversampling(128);   // 128次过采样
+  // 5. 配置罗盘参数（使用库函数）
+  #if DEBUG
+  Serial.println(F("3. Configuring compass parameters..."));
+  #endif
+  
+  // 设置50Hz采样率
+  compass.setSamplingRate(50);
+  
+  // 设置2高斯量程
+  compass.setRange(2);
+  
+  // 设置128次过采样
+  compass.setOversampling(128);
+  
+  // 6. 重置校准数据（重要！）
+  #if DEBUG
+  Serial.println(F("4. Resetting calibration..."));
+  #endif
+  compass.resetCalibration();
   
   delay(100);  // 等待配置生效
   
-  // 5. 测试读取
-  int validCount = 0;
-  float testHeading = 0;
-  int16_t x, y, z, t;
-  
+  // 7. 测试罗盘就绪状态 - 改进的重试机制
   #if DEBUG
-  Serial.println(F("Testing compass readings..."));
+  Serial.println(F("5. Testing sensor readiness..."));
   #endif
   
-  for (int i = 0; i < 10; i++) {
+  // 增加重试次数和延迟
+  int readyAttempts = 0;
+  bool sensorReady = false;
+  
+  while (readyAttempts < 30 && !sensorReady) {
+    readyAttempts++;
+    
+    // 尝试读取状态寄存器
     if (compass.ready()) {
-      // 读取原始数据
-      if (compass.readRaw(&x, &y, &z, &t)) {
-        #if DEBUG
-        Serial.print(F("Raw["));
-        Serial.print(i);
-        Serial.print(F("]: X="));
-        Serial.print(x);
-        Serial.print(F(" Y="));
-        Serial.print(y);
-        Serial.print(F(" Z="));
-        Serial.print(z);
-        Serial.print(F(" T="));
-        Serial.println(t);
-        #endif
-        
-        // 尝试读取航向
-        int heading = compass.readHeading();
-        if (heading >= 0 && heading <= 360) {
-          validCount++;
-          testHeading = heading;
-          
-          #if DEBUG
-          Serial.print(F("Heading["));
-          Serial.print(i);
-          Serial.print(F("]: "));
-          Serial.println(heading);
-          #endif
-        } else {
-          #if DEBUG
-          Serial.print(F("Invalid heading: "));
-          Serial.println(heading);
-          #endif
-        }
-      }
+      sensorReady = true;
     } else {
-      #if DEBUG
-      Serial.print(F("Sensor not ready, attempt "));
-      Serial.println(i);
-      #endif
+      // 每5次尝试后重置I2C
+      if (readyAttempts % 5 == 0) {
+        #if DEBUG
+        Serial.print(F("Attempt "));
+        Serial.print(readyAttempts);
+        Serial.println(F(", resetting I2C..."));
+        #endif
+        resetI2C();
+      }
+      delay(100);  // 增加延迟
     }
-    delay(50);
   }
   
-  if (validCount >= 5) {
-    // 应用磁偏角修正
-    float initialReading = normalizeAngle(testHeading + MAGNETIC_DECLINATION);
-    
-    // 初始化滤波数组
-    for (int i = 0; i < 3; i++) {
-      headingSamples[i] = initialReading;
-    }
-    
-    filteredHeading = initialReading;
-    virtualHeading = initialReading;
-    lastValidHeading = initialReading;
-    samplesReady = true;
-    
+  #if DEBUG
+  Serial.print(F("Ready check attempts: "));
+  Serial.println(readyAttempts);
+  Serial.print(F("Sensor ready: "));
+  Serial.println(sensorReady ? "YES" : "NO");
+  #endif
+  
+  if (!sensorReady) {
     #if DEBUG
-    Serial.print(F("Compass initialized successfully! Initial heading: "));
-    Serial.print(initialReading, 1);
-    Serial.print(F("°, Valid samples: "));
-    Serial.println(validCount);
+    Serial.println(F("Sensor not ready after 30 attempts, trying emergency reset..."));
     #endif
     
+    // 紧急重置：完全重新初始化
+    resetI2C();
+    hardwareResetQMC5883L();
+    delay(500);
+    
+    // 再次检查
+    readyAttempts = 0;
+    while (readyAttempts < 10 && !sensorReady) {
+      readyAttempts++;
+      if (compass.ready()) {
+        sensorReady = true;
+      }
+      delay(100);
+    }
+    
+    if (!sensorReady) {
+      #if DEBUG
+      Serial.println(F("Sensor still not ready after emergency reset"));
+      #endif
+      lcd.clear();
+      lcd.print(F("Sensor Not Ready"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Try Power Cycle"));
+      delay(2000);
+      return false;
+    }
+  }
+  
+  // 8. 读取原始数据验证传感器工作 - 改进验证
+  #if DEBUG
+  Serial.println(F("6. Testing raw data readings..."));
+  #endif
+  
+  int16_t x, y, z, t;
+  int validRawReadings = 0;
+  bool dataValid = false;
+  
+  for (int i = 0; i < 20; i++) {  // 增加尝试次数
+    if (compass.ready()) {
+      if (compass.readRaw(&x, &y, &z, &t)) {
+        validRawReadings++;
+        
+        // 检查数据是否合理（排除全0或异常值）
+        if (abs(x) > 10 || abs(y) > 10 || abs(z) > 10) {
+          dataValid = true;
+        }
+        
+        #if DEBUG
+        if (i == 0) {
+          Serial.print(F("First raw reading: X="));
+          Serial.print(x);
+          Serial.print(F(" Y="));
+          Serial.print(y);
+          Serial.print(F(" Z="));
+          Serial.print(z);
+          Serial.print(F(" T="));
+          Serial.println(t);
+        }
+        #endif
+      }
+    }
+    delay(100);
+  }
+  
+  #if DEBUG
+  Serial.print(F("Valid raw readings: "));
+  Serial.print(validRawReadings);
+  Serial.println(F("/20"));
+  #endif
+  
+  if (!dataValid) {
+    #if DEBUG
+    Serial.println(F("Data looks invalid (possible sensor lockup)"));
+    #endif
+    lcd.clear();
+    lcd.print(F("Invalid Data"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Move Sensor"));
+    delay(2000);
+  }
+  
+  // 9. 读取航向测试 - 增加采样数量
+  #if DEBUG
+  Serial.println(F("7. Testing heading readings..."));
+  #endif
+  
+  int validHeadingReadings = 0;
+  float sumHeading = 0;
+  
+  for (int i = 0; i < 50; i++) {  // 增加样本数
+    if (compass.ready()) {
+      int heading = compass.readHeading();
+      
+      if (heading >= 0 && heading <= 360) {
+        validHeadingReadings++;
+        sumHeading += heading;
+        
+        #if DEBUG
+        if (validHeadingReadings == 1) {
+          Serial.print(F("First valid heading: "));
+          Serial.println(heading);
+        }
+        #endif
+      }
+    }
+    delay(50);  // 缩短延迟以加快测试
+  }
+  
+  #if DEBUG
+  Serial.print(F("Valid heading readings: "));
+  Serial.print(validHeadingReadings);
+  Serial.println(F("/50"));
+  #endif
+  
+  if (validHeadingReadings < 15) {  // 降低阈值
+    #if DEBUG
+    Serial.println(F("Insufficient valid heading readings"));
+    #endif
+    lcd.clear();
+    lcd.print(F("Heading Data Low"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Move for Cal"));
+    delay(2000);
+  }
+  
+  // 10. 计算平均航向并设置初始值
+  float avgHeading = 0;
+  if (validHeadingReadings > 0) {
+    avgHeading = sumHeading / validHeadingReadings;
+  }
+  
+  float initialReading = normalizeAngle(avgHeading + MAGNETIC_DECLINATION);
+  
+  // 初始化滤波数组
+  for (int i = 0; i < 3; i++) {
+    headingSamples[i] = initialReading;
+  }
+  
+  filteredHeading = initialReading;
+  virtualHeading = initialReading;
+  lastValidHeading = initialReading;
+  samplesReady = (validHeadingReadings >= 3);
+  
+  // 11. 设置系统状态
+  compassInitialized = sensorReady && dataValid;
+  calibrationDone = false;  // 需要用户校准
+  compassResponding = true;
+  noChangeCount = 0;
+  
+  #if DEBUG
+  if (compassInitialized) {
+    Serial.print(F("Compass initialized successfully! Average heading: "));
+    Serial.print(avgHeading, 1);
+    Serial.print(F("°, With declination: "));
+    Serial.print(initialReading, 1);
+    Serial.print(F("°, Valid readings: "));
+    Serial.println(validHeadingReadings);
+    Serial.println(F("=== INITIALIZATION COMPLETE ==="));
+  } else {
+    Serial.println(F("Compass initialization partially successful - limited functionality"));
+  }
+  #endif
+  
+  if (compassInitialized) {
     lcd.clear();
     lcd.print(F("Compass OK"));
     lcd.setCursor(0, 1);
     lcd.print(F("Ready to Calibrate"));
-    delay(1000);
-    
-    compassInitialized = true;
-    calibrationDone = false;
-    compassResponding = true;
-    noChangeCount = 0;
-    
-    return true;
   } else {
-    #if DEBUG
-    Serial.print(F("Compass initialization failed, only "));
-    Serial.print(validCount);
-    Serial.println(F(" valid samples"));
-    #endif
-    
     lcd.clear();
-    lcd.print(F("Compass FAIL"));
+    lcd.print(F("Compass Limited"));
     lcd.setCursor(0, 1);
-    lcd.print(F("Check Sensor"));
-    delay(2000);
-    
-    return false;
+    lcd.print(F("Timeout Mode Only"));
   }
+  
+  delay(1000);
+  
+  return compassInitialized;
 }
 
 // ==================== I2C扫描函数 ====================
@@ -531,20 +766,20 @@ void calibrateCompass() {
   lcd.clear();
   lcd.print(F("Calibrating..."));
   lcd.setCursor(0, 1);
-  lcd.print(F("Rotate 360 degrees"));
+  lcd.print(F("Rotate 360°"));
   
   #if DEBUG
-  Serial.println(F("Starting calibration..."));
-  Serial.println(F("Please rotate the device 360 degrees"));
+  Serial.println(F("Starting compass calibration..."));
   #endif
+  
+  // 重置校准数据
+  compass.resetCalibration();
   
   unsigned long startTime = millis();
   int samples = 0;
   float headingSum = 0;
-  float minHeading = 360.0;
-  float maxHeading = 0.0;
   
-  // 收集5秒的样本
+  // 收集数据用于校准
   while (millis() - startTime < 5000) {
     if (compass.ready()) {
       int rawHeading = compass.readHeading();
@@ -553,9 +788,6 @@ void calibrateCompass() {
         samples++;
         float heading = normalizeAngle(rawHeading + MAGNETIC_DECLINATION);
         headingSum += heading;
-        
-        if (heading < minHeading) minHeading = heading;
-        if (heading > maxHeading) maxHeading = heading;
         
         #if DEBUG
         if (samples % 20 == 0) {
@@ -566,7 +798,7 @@ void calibrateCompass() {
         }
         #endif
         
-        // 更新LCD显示进度
+        // 更新LCD显示
         if (samples % 10 == 0) {
           lcd.setCursor(0, 1);
           lcd.print(F("Samples: "));
@@ -580,9 +812,8 @@ void calibrateCompass() {
   
   if (samples >= 20) {
     float avgHeading = headingSum / samples;
-    float variation = maxHeading - minHeading;
     
-    // 应用磁偏角修正
+    // 设置初始航向
     initialHeading = normalizeAngle(avgHeading);
     currentHeading = initialHeading;
     targetHeading = initialHeading;
@@ -601,14 +832,6 @@ void calibrateCompass() {
     Serial.println(samples);
     Serial.print(F("Average heading: "));
     Serial.print(avgHeading, 1);
-    Serial.println(F("°"));
-    Serial.print(F("Min heading: "));
-    Serial.print(minHeading, 1);
-    Serial.print(F("°, Max: "));
-    Serial.print(maxHeading, 1);
-    Serial.println(F("°"));
-    Serial.print(F("Variation: "));
-    Serial.print(variation, 1);
     Serial.println(F("°"));
     Serial.print(F("Initial heading set to: "));
     Serial.println(initialHeading, 1);
@@ -633,7 +856,7 @@ void calibrateCompass() {
     lcd.clear();
     lcd.print(F("Calibration FAIL"));
     lcd.setCursor(0, 1);
-    lcd.print(F("Not enough samples"));
+    lcd.print(F("Need more samples"));
   }
   
   delay(1000);
@@ -759,6 +982,46 @@ void processSerialInput() {
     }
   }
   #endif
+}
+
+// ==================== 新增：定期罗盘健康检查 ====================
+void checkCompassHealth() {
+  static unsigned long lastHealthCheck = 0;
+  static int consecutiveFailures = 0;
+  
+  // 每30秒检查一次
+  if (millis() - lastHealthCheck > 30000) {
+    lastHealthCheck = millis();
+    
+    if (compassInitialized) {
+      float testHeading;
+      bool readingOK = readCompassHeading(testHeading);
+      
+      if (!readingOK) {
+        consecutiveFailures++;
+        #if DEBUG
+        Serial.print(F("Compass health check failed #"));
+        Serial.println(consecutiveFailures);
+        #endif
+        
+        if (consecutiveFailures >= 3) {
+          // 连续3次失败，尝试恢复
+          recoverCompass();
+          consecutiveFailures = 0;
+        }
+      } else {
+        consecutiveFailures = 0;  // 重置失败计数
+        
+        // 检查数据是否合理
+        float change = fabs(testHeading - lastValidHeading);
+        if (change > 0.5) {
+          // 数据变化正常
+          lastHeadingChangeTime = millis();
+          compassResponding = true;
+        }
+      }
+    }
+  }
 }
 
 // ==================== 串口命令处理函数 ====================
@@ -977,7 +1240,7 @@ void handleSerialCommand(const char* command) {
     case 'I':
       if (!isRunning) {
         TIME_A_CIRCLE += 500;
-        if (TIME_A_CIRCLE > 13000) TIME_A_CIRCLE = 3000;
+        if (TIME_A_CIRCLE > 12000) TIME_A_CIRCLE = 3000;
         calculateMotorATimeout();
         lcd.clear();
         lcd.print(F("Circle Time:"));
@@ -1097,6 +1360,40 @@ void handleSerialCommand(const char* command) {
       }
       break;
       
+    case 'o':  // 优化版重新初始化罗盘
+    case 'O':
+      if (!isRunning) {
+        lcd.clear();
+        lcd.print(F("Reinit Compass"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Optimized..."));
+        
+        // 完全重置
+        compassInitialized = false;
+        calibrationDone = false;
+        
+        // 硬件复位
+        hardwareResetQMC5883L();
+        delay(200);
+        
+        // 重新初始化
+        bool success = initCompass();
+        
+        if (success) {
+          lcd.clear();
+          lcd.print(F("Reinit OK"));
+        } else {
+          lcd.clear();
+          lcd.print(F("Reinit FAIL"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("Try Power Cycle"));
+        }
+        
+        delay(1000);
+        updateDisplay();
+      }
+      break;
+      
     case 'z':  // 重启系统
     case 'Z':
       lcd.clear();
@@ -1107,6 +1404,12 @@ void handleSerialCommand(const char* command) {
       #if DEBUG
       Serial.println(F("System resetting..."));
       #endif
+      
+      // 在软复位前重置罗盘传感器
+      if (compassInitialized) {
+        hardwareResetQMC5883L();
+        delay(100);
+      }
       
       delay(1000);
       
@@ -1135,6 +1438,7 @@ void handleSerialCommand(const char* command) {
       Serial.println(F("Y - Display timeout info"));
       Serial.println(F("X - I2C scan"));
       Serial.println(F("W - Test compass raw data"));
+      Serial.println(F("O - Reinitialize compass"));
       Serial.println(F("Z - System reset"));
       Serial.println(F("H - This help"));
       Serial.println(F("=========================="));
@@ -1153,6 +1457,9 @@ void handleSerialCommand(const char* command) {
 
 // ==================== SETUP函数 ====================
 void setup() {
+  // 增加启动延迟，确保系统稳定
+  delay(500);
+  
   // 初始化引脚
   pinMode(MOTOR_A_IA, OUTPUT);
   pinMode(MOTOR_A_IB, OUTPUT);
@@ -1328,6 +1635,9 @@ void loop() {
   // 更新罗盘读数
   updateCompassHeading();
   
+  // 定期检查罗盘健康状态
+  checkCompassHealth();
+  
   #if DEBUG
   if (millis() - lastDebugTime > 1000) {
     float current = getCurrentHeading();
@@ -1445,7 +1755,7 @@ void handleObstacleEvent() {
   
   // 计算目标角度 - 按照您的要求：initialHeading - i * anglePerPlayer
   uint8_t currentPlayerIndex = dealtCards % playerCount;
-  targetHeading = normalizeAngle(initialHeading + (currentPlayerIndex * anglePerPlayer));
+  targetHeading = normalizeAngle(initialHeading - (currentPlayerIndex * anglePerPlayer));
   
   #if DEBUG
   Serial.print(F("Player index: "));
@@ -1563,6 +1873,18 @@ void stopDealing() {
   isRunning = 0;
   changeState(STATE_IDLE);
   stopAllMotors();
+  
+  // 发牌结束后重置罗盘状态
+  if (compassInitialized) {
+    // 如果不是由罗盘模式完成的，可能需要重置
+    if (!compassResponding || !calibrationDone) {
+      #if DEBUG
+      Serial.println(F("Resetting compass after dealing..."));
+      #endif
+      recoverCompass();
+    }
+  }
+  
   updateDisplay();
   
   #if DEBUG
@@ -1834,7 +2156,7 @@ void handleIRCommand(uint8_t command) {
     case 0x8C:  // 调整电机A一圈时间
       if (!isRunning) {
         TIME_A_CIRCLE += 500;
-        if (TIME_A_CIRCLE > 13000) TIME_A_CIRCLE = 3000;
+        if (TIME_A_CIRCLE > 12000) TIME_A_CIRCLE = 3000;
         calculateMotorATimeout();
         lcd.clear();
         lcd.print(F("Circle Time:"));
