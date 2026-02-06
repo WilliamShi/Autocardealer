@@ -86,8 +86,8 @@ bool obstacleActive = false;
 bool obstacleTriggered = false;
 
 // ==================== 电机A超时控制 ====================
-unsigned long TIME_A_CIRCLE = 10000;  // 电机A旋转一圈的时间（毫秒），减少到10秒（TB6612FNG更快）
-unsigned long motorATimeoutPerPlayer = 2500;  // 初始值：10000/4=2500ms
+unsigned long TIME_A_CIRCLE = 1000;  // 电机A旋转一圈的时间（毫秒），减少到10秒（TB6612FNG更快）
+unsigned long motorATimeoutPerPlayer = 250;  // 初始值：10000/4=2500ms
 
 // ==================== 改进的罗盘系统 ====================
 float lastStableHeading = 0.0;        // 最后一次稳定的罗盘读数
@@ -142,7 +142,7 @@ int i2cErrorCount = 0;
 const int I2C_ERROR_THRESHOLD = 3;  // 连续3次错误触发恢复
 
 // ==================== TB6612FNG 电机速度参数 ====================
-const int MOTOR_A_SPEED = 180;     // 电机A速度 (0-255)
+const int MOTOR_A_SPEED = 255;     // 电机A速度 (0-255)
 const int MOTOR_B_SPEED = 200;     // 电机B速度 (0-255)
 const int MOTOR_A_CAL_SPEED = 255; // 校准时的全速
 
@@ -595,7 +595,7 @@ void calibrateCompass() {
   unsigned long originalCircleTime = TIME_A_CIRCLE;
   
   // 设置全速旋转
-  TIME_A_CIRCLE = 10000;  // TB6612FNG更快，10秒一圈
+  TIME_A_CIRCLE = 5000;  // TB6612FNG更快，10秒一圈
   calculateMotorATimeout();
   
   // 记录开始角度
