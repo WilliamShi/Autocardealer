@@ -15,30 +15,41 @@ float anglePerPlayer = 90.0;  // 每个玩家之间的角度间隔，初始为4�
 
 #if ENABLE_INFRA
 #include <IRremote.hpp>
+#define IR_RECEIVE_PIN A1     // 红外接收器引脚
 #endif
 
 // ==================== 调试控制 ====================
 #define DEBUG 1  // 启用调试信息
 
-// ==================== 引脚定义 ====================
-#if ENABLE_INFRA
-#define RECV_PIN A1
-#endif
-#define OBSTACLE_PIN A0
+// ==================== TB6612FNG 引脚定义 ====================
+// 电机A控制引脚
+#define MOTOR_A_IN1 6     // AIN1
+#define MOTOR_A_IN2 7     // AIN2
+#define MOTOR_A_PWM 9     // PWMA (PWM引脚)
 
-// L9110电机驱动引脚
-#define MOTOR_A_IA 8
-#define MOTOR_A_IB 9
-#define MOTOR_B_IA 7
-#define MOTOR_B_IB 6
+// 电机B控制引脚
+#define MOTOR_B_IN1 A3    // BIN1 (模拟引脚作数字用)
+#define MOTOR_B_IN2 A2    // BIN2 (模拟引脚作数字用)
+#define MOTOR_B_PWM 10    // PWMB (PWM引脚)
+
+#define MOTOR_STBY 8      // STBY使能引脚
+
+// 传感器引脚
+#define OBSTACLE_PIN A0   // 红外避障模块输出
 
 // ==================== 角度转换宏 ====================
 #define DEG_TO_RAD 0.017453292519943295769236907684886
 #define RAD_TO_DEG 57.295779513082320876798154814105
 
 // ==================== 模块初始化 ====================
+// LCD引脚: RS=12, EN=11, D4=5, D5=4, D6=3, D7=2
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
 QMC5883LCompass compass;  // 使用新的库对象
+
+#if ENABLE_INFRA
+IRrecv irrecv(IR_RECEIVE_PIN);
+decode_results results;
+#endif
 
 // ==================== 系统状态 ====================
 enum SystemState {
@@ -75,8 +86,8 @@ bool obstacleActive = false;
 bool obstacleTriggered = false;
 
 // ==================== 电机A超时控制 ====================
-unsigned long TIME_A_CIRCLE = 15000;  // 电机A旋转一圈的时间（毫秒），增加到15秒
-unsigned long motorATimeoutPerPlayer = 1500;  // 初始值：6000/4=1500ms
+unsigned long TIME_A_CIRCLE = 10000;  // 电机A旋转一圈的时间（毫秒），减少到10秒（TB6612FNG更快）
+unsigned long motorATimeoutPerPlayer = 2500;  // 初始值：10000/4=2500ms
 
 // ==================== 改进的罗盘系统 ====================
 float lastStableHeading = 0.0;        // 最后一次稳定的罗盘读数
@@ -130,7 +141,33 @@ const unsigned long I2C_CHECK_INTERVAL = 30000;  // 每30秒检查一次
 int i2cErrorCount = 0;
 const int I2C_ERROR_THRESHOLD = 3;  // 连续3次错误触发恢复
 
-// ==================== 关键函数修正 ====================
+// ==================== TB6612FNG 电机速度参数 ====================
+const int MOTOR_A_SPEED = 180;     // 电机A速度 (0-255)
+const int MOTOR_B_SPEED = 200;     // 电机B速度 (0-255)
+const int MOTOR_A_CAL_SPEED = 255; // 校准时的全速
+
+// ==================== 红外遥控键码定义 ====================
+#if ENABLE_INFRA
+// 常见红外遥控器键码（可根据实际遥控器修改）
+#define IR_POWER 0xFFA25D
+#define IR_MENU 0xFF629D
+#define IR_PLAY_PAUSE 0xFFC23D
+#define IR_PREV 0xFF22DD
+#define IR_NEXT 0xFF02FD
+#define IR_EQ 0xFFE21D
+#define IR_MINUS 0xFFE01F
+#define IR_PLUS 0xFFA857
+#define IR_0 0xFF6897
+#define IR_1 0xFF30CF
+#define IR_2 0xFF18E7
+#define IR_3 0xFF7A85
+#define IR_4 0xFF10EF
+#define IR_5 0xFF38C7
+#define IR_6 0xFF5AA5
+#define IR_7 0xFF42BD
+#define IR_8 0xFF4AB5
+#define IR_9 0xFF52AD
+#endif
 
 // ==================== 角度处理函数 ====================
 float normalizeAngle(float angle) {
@@ -162,35 +199,79 @@ float getSimpleAngleDiff(float current, float target) {
   return diff;
 }
 
-// ==================== 电机控制函数 ====================
+// ==================== TB6612FNG 电机控制函数 ====================
+void enableMotorDriver() {
+  // 使能TB6612FNG芯片
+  digitalWrite(MOTOR_STBY, HIGH);
+  delay(10);
+}
+
+void disableMotorDriver() {
+  // 禁用TB6612FNG芯片
+  digitalWrite(MOTOR_STBY, LOW);
+}
+
 void stopAllMotors() {
-  digitalWrite(MOTOR_A_IA, LOW);
-  digitalWrite(MOTOR_A_IB, LOW);
-  digitalWrite(MOTOR_B_IA, LOW);
-  digitalWrite(MOTOR_B_IB, LOW);
+  // 使用TB6612FNG的刹车功能快速停止
+  // 电机A：刹车模式
+  digitalWrite(MOTOR_A_IN1, HIGH);
+  digitalWrite(MOTOR_A_IN2, HIGH);
+  analogWrite(MOTOR_A_PWM, 255);  // 刹车时PWM=255
+  
+  // 电机B：刹车模式
+  digitalWrite(MOTOR_B_IN1, HIGH);
+  digitalWrite(MOTOR_B_IN2, HIGH);
+  analogWrite(MOTOR_B_PWM, 255);
+  
+  delay(50);  // 刹车时间
+  
+  // 然后完全关闭电机
+  analogWrite(MOTOR_A_PWM, 0);
+  analogWrite(MOTOR_B_PWM, 0);
+  
+  rotationInProgress = false;
 }
 
 // ==================== 电机A控制 ====================
 void controlMotorA(bool enable) {
   if (enable) {
-    // 电机A永远逆时针旋转
-    digitalWrite(MOTOR_A_IA, LOW);
-    analogWrite(MOTOR_A_IB, 220);  // 较高速度
+    // 电机A逆时针旋转: IN1=0, IN2=1
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+    analogWrite(MOTOR_A_PWM, MOTOR_A_SPEED);
     rotationInProgress = true;
   } else {
-    digitalWrite(MOTOR_A_IA, LOW);
-    digitalWrite(MOTOR_A_IB, LOW);
+    // 快速停止电机A
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+    analogWrite(MOTOR_A_PWM, 255);
+    delay(20);
+    analogWrite(MOTOR_A_PWM, 0);
     rotationInProgress = false;
   }
 }
 
+// 电机A全速旋转（用于校准）
+void controlMotorAFullSpeed() {
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, HIGH);
+  analogWrite(MOTOR_A_PWM, MOTOR_A_CAL_SPEED);
+  rotationInProgress = true;
+}
+
 void controlMotorB(uint8_t state) {
   if (state) {
-    analogWrite(MOTOR_B_IA, 255);  // 中等速度
-    digitalWrite(MOTOR_B_IB, LOW);
+    // 电机B正转: IN1=0, IN2=1
+    digitalWrite(MOTOR_B_IN1, LOW);
+    digitalWrite(MOTOR_B_IN2, HIGH);
+    analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED);
   } else {
-    digitalWrite(MOTOR_B_IA, LOW);
-    digitalWrite(MOTOR_B_IB, LOW);
+    // 快速停止电机B
+    digitalWrite(MOTOR_B_IN1, HIGH);
+    digitalWrite(MOTOR_B_IN2, HIGH);
+    analogWrite(MOTOR_B_PWM, 255);
+    delay(20);
+    analogWrite(MOTOR_B_PWM, 0);
   }
 }
 
@@ -200,8 +281,8 @@ void calculateMotorATimeout() {
   motorATimeoutPerPlayer = TIME_A_CIRCLE / playerCount;
   
   // 确保最小超时时间
-  if (motorATimeoutPerPlayer < 1500) {
-    motorATimeoutPerPlayer = 1500;
+  if (motorATimeoutPerPlayer < 1000) {
+    motorATimeoutPerPlayer = 1000;
   }
   
   #if DEBUG
@@ -237,6 +318,26 @@ bool readCompassHeading(float &heading) {
   return false;
 }
 
+// ==================== 改进的虚拟角度跟踪 ====================
+float updateVirtualHeadingDuringRotation() {
+  if (!rotationInProgress) return virtualHeading;
+  
+  // 计算基于时间的虚拟旋转
+  unsigned long currentTime = millis();
+  unsigned long elapsed = currentTime - rotationStartTime;
+  
+  // TB6612FNG更快：10秒/360° = 36°/秒
+  float rotationSpeed = 360.0 / (TIME_A_CIRCLE / 1000.0); // 度/秒
+  
+  // 计算应该旋转的角度
+  float expectedRotation = (elapsed / 1000.0) * rotationSpeed;
+  
+  // 更新虚拟角度（逆时针旋转）
+  virtualHeading = normalizeAngle(rotationStartHeading - expectedRotation);
+  
+  return virtualHeading;
+}
+
 // ==================== 改进的罗盘更新函数 ====================
 void updateCompassHeading() {
   if (!compassInitialized) return;
@@ -247,6 +348,31 @@ void updateCompassHeading() {
   
   float newHeading;
   if (readCompassHeading(newHeading)) {
+    // 改进：检测非物理性跳变
+    static float lastRawHeading = newHeading;
+    float headingChange = fabs(newHeading - lastRawHeading);
+    
+    // 如果变化过大（>30°/采样周期），可能是干扰，使用虚拟角度
+    if (headingChange > 30.0 && rotationInProgress) {
+      // 电机正在运行时，变化率应该有限
+      #if DEBUG
+      static unsigned long lastJumpWarning = 0;
+      if (millis() - lastJumpWarning > 1000) {
+        Serial.print(F("Warning: Unphysical heading jump: "));
+        Serial.print(headingChange);
+        Serial.println(F("°"));
+        lastJumpWarning = millis();
+      }
+      #endif
+      
+      // 使用虚拟角度继续跟踪
+      virtualHeading = updateVirtualHeadingDuringRotation();
+      newHeading = virtualHeading;
+    } else {
+      lastRawHeading = newHeading;
+      virtualHeading = newHeading; // 更新虚拟角度
+    }
+    
     float change = fabs(newHeading - lastValidHeading);
     
     if (change > 0.5) {
@@ -278,8 +404,6 @@ void updateCompassHeading() {
     } else {
       filteredHeading = newHeading;
     }
-    
-    virtualHeading = filteredHeading;
   }
   
   lastCompassUpdate = millis();
@@ -288,9 +412,29 @@ void updateCompassHeading() {
 // ==================== 获取当前航向 ====================
 float getCurrentHeading() {
   if (compassInitialized && compassResponding) {
+    // 如果角度变化过快，使用虚拟角度
+    static float lastCompassReading = filteredHeading;
+    float currentReading = filteredHeading;
+    float changeRate = fabs(currentReading - lastCompassReading) / 
+                      (COMPASS_UPDATE_INTERVAL / 1000.0);
+    
+    if (rotationInProgress && changeRate > 60.0) { // 最大物理旋转速率假设
+      #if DEBUG
+      static unsigned long lastRateWarning = 0;
+      if (millis() - lastRateWarning > 2000) {
+        Serial.print(F("Using virtual heading - change rate too high: "));
+        Serial.println(changeRate);
+        lastRateWarning = millis();
+      }
+      #endif
+      lastCompassReading = currentReading;
+      return updateVirtualHeadingDuringRotation();
+    }
+    
+    lastCompassReading = currentReading;
     return filteredHeading;
   } else {
-    return virtualHeading;
+    return updateVirtualHeadingDuringRotation();
   }
 }
 
@@ -304,6 +448,7 @@ bool initCompassUltimate() {
   lcd.print(F("Init Compass..."));
   
   stopAllMotors();
+  disableMotorDriver();
   delay(100);
   
   Wire.end();
@@ -421,7 +566,7 @@ bool initCompassUltimate() {
   return compassInitialized;
 }
 
-// ==================== 改进的校准函数（15秒全速旋转） ====================
+// ==================== 改进的校准函数（10秒全速旋转） ====================
 void calibrateCompass() {
   if (!compassInitialized) {
     #if DEBUG
@@ -436,20 +581,21 @@ void calibrateCompass() {
   lcd.clear();
   lcd.print(F("Calibrating..."));
   lcd.setCursor(0, 1);
-  lcd.print(F("15s Full Speed"));
+  lcd.print(F("10s Full Speed"));
   
   #if DEBUG
   Serial.println(F("Starting compass calibration..."));
-  Serial.println(F("Motor A will rotate at full speed for 15 seconds"));
+  Serial.println(F("Motor A will rotate at full speed for 10 seconds"));
   #endif
   
   stopAllMotors();
   delay(200);
+  enableMotorDriver();
   
   unsigned long originalCircleTime = TIME_A_CIRCLE;
   
   // 设置全速旋转
-  TIME_A_CIRCLE = 15000;  // 15秒一圈
+  TIME_A_CIRCLE = 10000;  // TB6612FNG更快，10秒一圈
   calculateMotorATimeout();
   
   // 记录开始角度
@@ -466,11 +612,10 @@ void calibrateCompass() {
   #endif
   
   // 启动电机A全速旋转
-  digitalWrite(MOTOR_A_IA, LOW);
-  analogWrite(MOTOR_A_IB, 255);  // 全速
+  controlMotorAFullSpeed();
   
   unsigned long calibrationStartTime = millis();
-  unsigned long rotationDuration = 15000;  // 15秒校准时间
+  unsigned long rotationDuration = 10000;  // 10秒校准时间（TB6612FNG更快）
   unsigned long lastSampleTime = 0;
   
   int samples = 0;
@@ -543,7 +688,7 @@ void calibrateCompass() {
   Serial.println(F("°"));
   #endif
   
-  if (validSamples >= 100 && finalRange > 300.0) {
+  if (validSamples >= 80 && finalRange > 300.0) {  // 减少所需样本数，因为时间更短
     float sumSin = 0.0;
     float sumCos = 0.0;
     
@@ -609,7 +754,7 @@ void calibrateCompass() {
   delay(1500);
 }
 
-// ==================== 智能旋转控制 ====================
+// ==================== 智能旋转控制 - 增强版 ====================
 bool rotateToAngle() {
   if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) {
     return false;
@@ -619,6 +764,10 @@ bool rotateToAngle() {
   float current = getCurrentHeading();
   float angleDiff = getSimpleAngleDiff(current, targetHeading);
   unsigned long elapsed = millis() - aMotorTimeoutStart;
+  
+  // 新增：计算期望的最小旋转时间
+  float requiredRotation = fabs(getSimpleAngleDiff(rotationStartHeading, targetHeading));
+  float minRotationTime = (requiredRotation / 360.0) * TIME_A_CIRCLE * 0.6; // 60%的理论时间（TB6612FNG更快）
   
   #if DEBUG
   static unsigned long lastRotateDebug = 0;
@@ -631,6 +780,8 @@ bool rotateToAngle() {
     Serial.print(angleDiff, 1);
     Serial.print(F("°, elapsed="));
     Serial.print(elapsed);
+    Serial.print(F("ms, minTime="));
+    Serial.print((int)minRotationTime);
     Serial.print(F("ms"));
     
     if (compassInitialized && compassResponding && calibrationDone) {
@@ -648,19 +799,23 @@ bool rotateToAngle() {
   
   // 模式1：罗盘模式
   if (compassInitialized && compassResponding && calibrationDone) {
-    // 条件1：角度差小于容差
-    if (fabs(angleDiff) <= angleTolerance && elapsed > 1000) {
+    // 新增条件：必须旋转至少最小时间
+    if (fabs(angleDiff) <= angleTolerance && elapsed > 800 && elapsed > minRotationTime) {
       shouldStop = true;
       #if DEBUG
       Serial.print(F("✓ Target reached! Angle diff="));
       Serial.print(fabs(angleDiff), 1);
-      Serial.println(F("°"));
+      Serial.print(F("°, minTime met: "));
+      Serial.print(elapsed);
+      Serial.print(F("ms > "));
+      Serial.print((int)minRotationTime);
+      Serial.println(F("ms"));
       #endif
     }
   } 
   
-  // 条件2：超时
-  if (elapsed >= motorATimeoutPerPlayer) {
+  // 条件2：超时（稍微放宽）
+  if (elapsed >= motorATimeoutPerPlayer * 1.2) { // 增加20%余量
     shouldStop = true;
     #if DEBUG
     Serial.print(F("⏱ Rotation timeout after "));
@@ -736,12 +891,16 @@ void handleObstacleEvent() {
   Serial.println(targetHeading, 1);
   #endif
   
-  // 记录旋转开始时的角度
+  // 记录旋转开始时的角度和时间
   for (int i = 0; i < 3; i++) {
     updateCompassHeading();
     delay(50);
   }
   rotationStartHeading = getCurrentHeading();
+  rotationStartTime = millis(); // 记录旋转开始时间
+  
+  // 重置虚拟角度到当前实际角度
+  virtualHeading = rotationStartHeading;
   
   changeState(STATE_A_RUNNING);
   aMotorTimeoutStart = millis();
@@ -800,6 +959,7 @@ void startDealing() {
   dealtCards = 0;
   
   stopAllMotors();
+  enableMotorDriver();
   
   if (compassInitialized && calibrationDone) {
     // 等待罗盘稳定
@@ -912,6 +1072,114 @@ void handleMotorState() {
   }
 }
 
+// ==================== 红外遥控处理 ====================
+#if ENABLE_INFRA
+void processInfraredInput() {
+  if (IrReceiver.decode()) {
+    unsigned long irValue = IrReceiver.decodedIRData.decodedRawData;
+    
+    #if DEBUG
+    Serial.print(F("IR Received: 0x"));
+    Serial.println(irValue, HEX);
+    #endif
+    
+    // 根据红外键码执行相应操作
+    switch(irValue) {
+      case IR_PLAY_PAUSE:  // 播放/暂停键
+        if (!isRunning) {
+          startDealing();
+        } else {
+          stopDealing();
+        }
+        break;
+        
+      case IR_PREV:  // 上一曲键 - 减少玩家数量
+        if (!isRunning) {
+          if (playerCount > 2) playerCount--;
+          else playerCount = 8;
+          anglePerPlayer = 360.0 / playerCount;
+          calculateMotorATimeout();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_NEXT:  // 下一曲键 - 增加玩家数量
+        if (!isRunning) {
+          playerCount++;
+          if (playerCount > 8) playerCount = 2;
+          anglePerPlayer = 360.0 / playerCount;
+          calculateMotorATimeout();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_0:  // 数字0 - 校准罗盘
+        if (!isRunning && compassInitialized) {
+          calibrateCompass();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_1:  // 数字1 - 重置到默认
+        if (!isRunning) {
+          playerCount = 4;
+          deckCount = 3;
+          hasJokers = 1;
+          remainCards = 0;
+          totalCards = deckCount * (hasJokers ? 54 : 52);
+          anglePerPlayer = 360.0 / playerCount;
+          calculateMotorATimeout();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_2:  // 数字2 - 切换有无王
+        if (!isRunning) {
+          hasJokers = !hasJokers;
+          totalCards = deckCount * (hasJokers ? 54 : 52);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_3:  // 数字3 - 增加牌组
+        if (!isRunning) {
+          deckCount++;
+          if (deckCount > 3) deckCount = 1;
+          totalCards = deckCount * (hasJokers ? 54 : 52);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_PLUS:  // +键 - 测试电机A
+        if (!isRunning) {
+          enableMotorDriver();
+          controlMotorA(true);
+          lcd.clear();
+          lcd.print(F("Motor A Test"));
+          delay(1000);
+          stopAllMotors();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_MINUS:  // -键 - 测试电机B
+        if (!isRunning) {
+          enableMotorDriver();
+          controlMotorB(1);
+          lcd.clear();
+          lcd.print(F("Motor B Test"));
+          delay(1000);
+          stopAllMotors();
+          updateDisplay();
+        }
+        break;
+    }
+    
+    IrReceiver.resume();  // 准备接收下一个红外信号
+  }
+}
+#endif
+
 // ==================== 串口输入处理 ====================
 void processSerialInput() {
   #if ENABLE_KEYBOARD
@@ -952,9 +1220,9 @@ void handleSerialCommand(const char* command) {
     case 'v':  // 版本显示
     case 'V':
       lcd.clear();
-      lcd.print(F("Card Dealer v24.2"));
+      lcd.print(F("Card Dealer v25.1"));
       lcd.setCursor(0, 1);
-      lcd.print(F("Fixed Compass"));
+      lcd.print(F("All-in-One Setup"));
       delay(1000);
       updateDisplay();
       break;
@@ -1026,6 +1294,7 @@ void handleSerialCommand(const char* command) {
         updateDisplay();
       } else {
         stopAllMotors();
+        disableMotorDriver();
         changeState(STATE_IDLE);
         lcd.clear();
         lcd.print(F("Force Stop"));
@@ -1037,6 +1306,7 @@ void handleSerialCommand(const char* command) {
     case 'a':  // 测试电机A旋转90度
     case 'A':
       if (!isRunning) {
+        enableMotorDriver();
         float startAngle = getCurrentHeading();
         float testTarget = normalizeAngle(startAngle - 90);  // 逆时针旋转
         
@@ -1057,11 +1327,11 @@ void handleSerialCommand(const char* command) {
         #endif
         
         rotationStartHeading = startAngle;
+        rotationStartTime = millis();
         aMotorTimeoutStart = millis();
         targetHeading = testTarget;
         
-        digitalWrite(MOTOR_A_IA, LOW);
-        analogWrite(MOTOR_A_IB, 255);
+        controlMotorA(true);
         
         unsigned long testStart = millis();
         bool testComplete = false;
@@ -1069,8 +1339,11 @@ void handleSerialCommand(const char* command) {
         while (!testComplete && millis() - testStart < 10000) {
           float current = getCurrentHeading();
           float diff = getSimpleAngleDiff(current, testTarget);
+          float requiredRotation = fabs(getSimpleAngleDiff(startAngle, testTarget));
+          float minRotationTime = (requiredRotation / 360.0) * TIME_A_CIRCLE * 0.6;
           
-          if (fabs(diff) <= angleTolerance || (millis() - aMotorTimeoutStart >= motorATimeoutPerPlayer)) {
+          if ((fabs(diff) <= angleTolerance && (millis() - aMotorTimeoutStart > minRotationTime)) || 
+              (millis() - aMotorTimeoutStart >= motorATimeoutPerPlayer)) {
             testComplete = true;
             stopAllMotors();
             
@@ -1107,6 +1380,7 @@ void handleSerialCommand(const char* command) {
     case 'b':  // 测试电机B
     case 'B':
       if (!isRunning) {
+        enableMotorDriver();
         controlMotorB(1);
         lcd.clear();
         lcd.print(F("Motor B ON Test"));
@@ -1126,7 +1400,7 @@ void handleSerialCommand(const char* command) {
       
     case 'h':  // 显示帮助信息
     case 'H':
-      Serial.println(F("=== Card Dealer Commands v24.2 ==="));
+      Serial.println(F("=== Card Dealer Commands v25.1 ==="));
       Serial.println(F("V - Version display"));
       Serial.println(F("P - Increase player count"));
       Serial.println(F("D - Increase deck count"));
@@ -1248,30 +1522,46 @@ void showStatusMessage(const char* message) {
 void setup() {
   delay(500);
   
-  pinMode(MOTOR_A_IA, OUTPUT);
-  pinMode(MOTOR_A_IB, OUTPUT);
-  pinMode(MOTOR_B_IA, OUTPUT);
-  pinMode(MOTOR_B_IB, OUTPUT);
+  // 初始化TB6612FNG引脚
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_A_PWM, OUTPUT);
+  pinMode(MOTOR_B_IN1, OUTPUT);
+  pinMode(MOTOR_B_IN2, OUTPUT);
+  pinMode(MOTOR_B_PWM, OUTPUT);
+  pinMode(MOTOR_STBY, OUTPUT);
   pinMode(OBSTACLE_PIN, INPUT_PULLUP);
   
-  stopAllMotors();
+  // 初始化时禁用电机驱动
+  disableMotorDriver();
   
   lcd.begin(16, 2);
   lcd.clear();
-  lcd.print(F("Card Dealer v24.2"));
+  lcd.print(F("Card Dealer v25.1"));
   lcd.setCursor(0, 1);
-  lcd.print(F("Fixed Rotation"));
+  lcd.print(F("All Devices Ready"));
   
   #if DEBUG
   Serial.begin(9600);
   delay(500);
-  Serial.println(F("System Startup v24.2"));
+  Serial.println(F("System Startup v25.1"));
   Serial.println(F("=========================="));
-  Serial.println(F("MOTOR A: CCW ONLY MODE"));
-  Serial.print(F("Magnetic Declination: "));
-  Serial.print(MAGNETIC_DECLINATION);
-  Serial.println(F("° (Shanghai)"));
-  Serial.println(F("FIXED: CCW rotation = initial - angle"));
+  Serial.println(F("DEVICES CONNECTED:"));
+  Serial.println(F("1. TB6612FNG Motor Driver"));
+  Serial.println(F("2. QMC5883L Compass"));
+  Serial.println(F("3. LCD1602 Display"));
+  Serial.println(F("4. VS1838B IR Receiver"));
+  Serial.println(F("5. IR Obstacle Sensor"));
+  Serial.println(F("=========================="));
+  Serial.print(F("Motor A Speed: "));
+  Serial.println(MOTOR_A_SPEED);
+  Serial.print(F("Motor B Speed: "));
+  Serial.println(MOTOR_B_SPEED);
+  #endif
+  
+  // 初始化红外接收
+  #if ENABLE_INFRA
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
   #endif
   
   Wire.begin();
@@ -1374,6 +1664,11 @@ void setup() {
 // ==================== LOOP函数 ====================
 void loop() {
   processSerialInput();
+  
+  #if ENABLE_INFRA
+  processInfraredInput();
+  #endif
+  
   checkObstacle();
   
   if (isRunning) {
@@ -1424,3 +1719,104 @@ void loop() {
   
   delay(10);
 }
+/*
+一、引脚重新分配方案
+Arduino Pro Mini 引脚使用表
+设备	引脚	功能	备注
+LCD1602 (4位模式)			
+RS	12	寄存器选择	
+EN	11	使能	
+D4	5	数据线4	
+D5	4	数据线5	
+D6	3	数据线6	
+D7	2	数据线7	
+TB6612FNG			
+AIN1	6	电机A方向1	
+AIN2	7	电机A方向2	
+PWMA	9	电机A速度(PWM)	
+BIN1	A3	电机B方向1	模拟引脚作数字用
+BIN2	A2	电机B方向2	模拟引脚作数字用
+PWMB	10	电机B速度(PWM)	
+STBY	8	使能控制	
+传感器模块			
+QMC5883L	A4, A5	I2C	SDA=A4, SCL=A5
+红外接收(VS1838B)	A1	信号输入	模拟引脚作数字用
+红外避障模块	A0	信号输出	模拟引脚作数字用
+
+二完整代码，见上
+
+三、电路连接清单
+必须的连接：
+电源连接：
+
+TB6612FNG VM → 外部7-12V电源正极
+
+TB6612FNG GND → 外部电源负极 并且 连接到Arduino GND
+
+TB6612FNG VCC → Arduino 5V
+
+必须的电容：
+
+VM和GND之间：100µF电解电容 + 0.1µF瓷片电容
+
+VCC和GND之间：0.1µF瓷片电容
+
+电机连接：
+
+电机A → TB6612FNG的AO1和AO2
+
+电机B → TB6612FNG的BO1和BO2
+
+Arduino连接表：
+
+设备	引脚连接
+LCD1602 RS → Arduino 12	
+LCD1602 EN → Arduino 11	
+LCD1602 D4 → Arduino 5	
+LCD1602 D5 → Arduino 4	
+LCD1602 D6 → Arduino 3	
+LCD1602 D7 → Arduino 2	
+TB6612FNG AIN1 → Arduino 6	
+TB6612FNG AIN2 → Arduino 7	
+TB6612FNG PWMA → Arduino 9	
+TB6612FNG BIN1 → Arduino A3	
+TB6612FNG BIN2 → Arduino A2	
+TB6612FNG PWMB → Arduino 10	
+TB6612FNG STBY → Arduino 8	
+QMC5883L SDA → Arduino A4	
+QMC5883L SCL → Arduino A5	
+红外接收(VS1838B) OUT → Arduino A1	
+红外避障模块 OUT → Arduino A0	
+电源连接：
+
+LCD1602 VCC → Arduino 5V
+
+LCD1602 GND → Arduino GND
+
+红外接收器 VCC → Arduino 5V
+
+红外接收器 GND → Arduino GND
+
+红外避障模块 VCC → Arduino 5V
+
+红外避障模块 GND → Arduino GND
+
+QMC5883L VCC → Arduino 5V
+
+QMC5883L GND → Arduino GND
+
+四、主要特点
+无引脚冲突：所有设备引脚都经过仔细分配，避免冲突
+
+全功能支持：支持所有你提到的设备
+
+红外遥控：增加了红外遥控功能，可以通过遥控器控制发牌机
+
+TB6612FNG优化：充分利用了TB6612FNG的刹车功能，控制更精确
+
+调试友好：保留了完整的调试信息输出
+
+这个版本已经考虑了所有设备的引脚分配，应该可以直接使用。请按照上述连接表仔细连接所有设备。
+*/
+
+
