@@ -1,50 +1,40 @@
+// ==================== 系统配置宏 ====================
+#define TURNAROUND_MODE 0      // 0=超时模式, 1=罗盘模式
+#define ENABLE_INFRA 1
+#define ENABLE_KEYBOARD 0
+#define DEBUG 1
+#define IR_DEBUG 1  // 专门控制红外调试
+//#define MOTOR_B_TIMEOUT_MS 8000
+
 // ==================== 系统变量 ====================
-float initialHeading = 0;     // 校准时的初始航向角度，作为系统参考零点
-float targetHeading = 0;      // 电机A需要旋转到的目标角度
-float currentHeading = 0;     // 当前电子罗盘的实时航向角度
-float angleTolerance = 10.0;  // 角度容差范围10°
-float anglePerPlayer = 90.0;  // 每个玩家之间的角度间隔，初始为4个玩家(360°/4=90°)
+float initialHeading = 0;
+float targetHeading = 0;
+float currentHeading = 0;
+float angleTolerance = 8.0;
+float anglePerPlayer = 90.0;
 
 #include <LiquidCrystal.h>
 #include <Wire.h>
-#include <QMC5883LCompass.h>  // 使用Arduino自带的QMC5883LCompass库
-
-// ==================== 输入控制宏 ====================
-#define ENABLE_INFRA 0        // 启用红外输入
-#define ENABLE_KEYBOARD 1     // 启用键盘（串口）输入
+#include <QMC5883LCompass.h>
 
 #if ENABLE_INFRA
 #include <IRremote.hpp>
-#define IR_RECEIVE_PIN A1     // 红外接收器引脚
+#define IR_RECEIVE_PIN A1
 #endif
 
-// ==================== 调试控制 ====================
-#define DEBUG 1  // 启用调试信息
-
 // ==================== TB6612FNG 引脚定义 ====================
-// 电机A控制引脚
-#define MOTOR_A_IN1 6     // AIN1
-#define MOTOR_A_IN2 7     // AIN2
-#define MOTOR_A_PWM 9     // PWMA (PWM引脚)
-
-// 电机B控制引脚
-#define MOTOR_B_IN1 A3    // BIN1 (模拟引脚作数字用)
-#define MOTOR_B_IN2 A2    // BIN2 (模拟引脚作数字用)
-#define MOTOR_B_PWM 10    // PWMB (PWM引脚)
-
-#define MOTOR_STBY 8      // STBY使能引脚
-
-// 传感器引脚
-#define OBSTACLE_PIN A0   // 红外避障模块输出
-
-// ==================== 角度转换宏 ====================
-#define DEG_TO_RAD 0.017453292519943295769236907684886
-#define RAD_TO_DEG 57.295779513082320876798154814105
+#define MOTOR_A_IN1 6
+#define MOTOR_A_IN2 7
+#define MOTOR_A_PWM 9
+#define MOTOR_B_IN1 A3
+#define MOTOR_B_IN2 A2
+#define MOTOR_B_PWM 10
+#define MOTOR_STBY 8
+#define OBSTACLE_PIN A0
 
 // ==================== 模块初始化 ====================
-// LCD引脚: RS=12, EN=11, D4=5, D5=4, D6=3, D7=2
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
-QMC5883LCompass compass;  // 使用新的库对象
+QMC5883LCompass compass;
 
 #if ENABLE_INFRA
 IRrecv irrecv(IR_RECEIVE_PIN);
@@ -56,7 +46,8 @@ enum SystemState {
   STATE_IDLE,
   STATE_B_RUNNING,
   STATE_A_RUNNING,
-  STATE_B_TIMEOUT
+  STATE_B_TIMEOUT,
+  STATE_OBJECT_DETECTED  // 物体被检测到状态
 };
 
 // ==================== 全局变量 ====================
@@ -64,10 +55,8 @@ uint8_t playerCount = 4;
 uint8_t deckCount = 3;
 uint8_t remainCards = 0;
 uint8_t hasJokers = 1;
-
 uint16_t totalCards = 0;
 uint16_t dealtCards = 0;
-
 SystemState currentState = STATE_IDLE;
 bool isRunning = 0;
 
@@ -76,182 +65,147 @@ unsigned long lastObstacleTime = 0;
 unsigned long obstacleDebounce = 0;
 unsigned long lastDebugTime = 0;
 unsigned long aMotorTimeoutStart = 0;
-
+unsigned long motorBTimeout = 8000;
 bool compassInitialized = false;
 bool calibrationDone = false;
-
 uint8_t lastObstacleState = HIGH;
 uint8_t obstacleState = HIGH;
 bool obstacleActive = false;
 bool obstacleTriggered = false;
 
-// ==================== 电机A超时控制 ====================
-unsigned long TIME_A_CIRCLE = 1000;  // 电机A旋转一圈的时间（毫秒），减少到10秒（TB6612FNG更快）
-unsigned long motorATimeoutPerPlayer = 250;  // 初始值：10000/4=2500ms
+// 物体检测相关变量
+bool obstacleDetected = false;       // 物体是否被检测到
+unsigned long objectDetectedTime = 0; // 物体被检测到的时间
+unsigned long objectLeaveTime = 0;    // 物体离开的时间
+unsigned long objectPresentTimeout = 2000; // 物体存在超时时间（2秒）
+bool waitingForObjectLeave = false;   // 是否在等待物体离开
 
-// ==================== 改进的罗盘系统 ====================
-float lastStableHeading = 0.0;        // 最后一次稳定的罗盘读数
-float filteredHeading = 0.0;          // 滤波后的航向
-float headingSamples[3];              // 采样数组
+// ==================== 关键修正：手动校准的电机参数 ====================
+// 通过实验手动调整这些值，直到旋转角度准确
+unsigned long MANUAL_CIRCLE_TIME = 3050;  // 手动设置的一圈时间（单位：ms）
+unsigned long motorATimeoutPerPlayer = 765;  // MANUAL_CIRCLE_TIME / playerCount
+
+// 运行时模式切换
+bool runtimeTurnaroundMode = TURNAROUND_MODE;
+
+// ==================== 罗盘系统 ====================
+float lastStableHeading = 0.0;
+float filteredHeading = 0.0;
+float headingSamples[3];
 int sampleIndex = 0;
 bool samplesReady = false;
 unsigned long lastCompassUpdate = 0;
-const int COMPASS_UPDATE_INTERVAL = 30;  // 更新间隔
+const int COMPASS_UPDATE_INTERVAL = 30;
 
-// ==================== 罗盘响应检测 ====================
 float lastValidHeading = 0.0;
 unsigned long lastHeadingChangeTime = 0;
 bool compassResponding = true;
 int noChangeCount = 0;
-const int MAX_NO_CHANGE = 15;  // 连续15次无变化认为罗盘卡住
+const int MAX_NO_CHANGE = 15;
 
-// ==================== 虚拟角度备份系统 ====================
-float virtualHeading = 0.0;           // 虚拟航向，用于罗盘失效时
-
-// ==================== 上海地区磁偏角修正 ====================
-const float MAGNETIC_DECLINATION = 5.0;  // 上海地区的磁偏角（西偏为正）
+float virtualHeading = 0.0;
+const float MAGNETIC_DECLINATION = 5.0;
 
 // ==================== 电机控制参数 ====================
-unsigned long lastMotorUpdate = 0;       // 上次电机控制更新时间
-const int MOTOR_CONTROL_INTERVAL = 50;   // 电机控制更新间隔(ms)，约20Hz
+unsigned long lastMotorUpdate = 0;
+const int MOTOR_CONTROL_INTERVAL = 20;
 
 // ==================== 电机A旋转状态跟踪 ====================
-float rotationStartHeading = 0.0;        // 旋转开始时的角度
-unsigned long rotationStartTime = 0;     // 旋转开始时间
-float lastRotationAngle = 0.0;           // 上次旋转时的角度
-bool rotationInProgress = false;         // 旋转是否在进行中
+float rotationStartHeading = 0.0;
+unsigned long rotationStartTime = 0;
+float lastRotationAngle = 0.0;
+bool rotationInProgress = false;
 
 // ==================== 串口输入缓冲区 ====================
 const int SERIAL_BUFFER_SIZE = 32;
 char serialBuffer[SERIAL_BUFFER_SIZE];
 int serialBufferIndex = 0;
 unsigned long lastSerialCharTime = 0;
-const unsigned long SERIAL_TIMEOUT = 100;  // 串口输入超时时间
-
-// ==================== 电机A旋转检测 ====================
-float motorA_lastHeading = 0.0;
-unsigned long motorA_lastCheckTime = 0;
-const unsigned long MOTOR_A_CHECK_INTERVAL = 500;  // 每500ms检查一次
-int motorA_stuckCount = 0;
-const int MOTOR_A_STUCK_THRESHOLD = 3;  // 连续3次无变化认为电机卡住
-
-// ==================== I2C看门狗 ====================
-unsigned long lastI2CCheck = 0;
-const unsigned long I2C_CHECK_INTERVAL = 30000;  // 每30秒检查一次
-int i2cErrorCount = 0;
-const int I2C_ERROR_THRESHOLD = 3;  // 连续3次错误触发恢复
+const unsigned long SERIAL_TIMEOUT = 100;
 
 // ==================== TB6612FNG 电机速度参数 ====================
-const int MOTOR_A_SPEED = 255;     // 电机A速度 (0-255)
-const int MOTOR_B_SPEED = 200;     // 电机B速度 (0-255)
-const int MOTOR_A_CAL_SPEED = 255; // 校准时的全速
+const int MOTOR_A_SPEED = 150;     // 固定速度150
+const int MOTOR_B_SPEED = 255;
+const int MOTOR_A_CAL_SPEED = 200;
 
 // ==================== 红外遥控键码定义 ====================
 #if ENABLE_INFRA
-// 常见红外遥控器键码（可根据实际遥控器修改）
-#define IR_POWER 0xFFA25D
-#define IR_MENU 0xFF629D
-#define IR_PLAY_PAUSE 0xFFC23D
-#define IR_PREV 0xFF22DD
-#define IR_NEXT 0xFF02FD
-#define IR_EQ 0xFFE21D
-#define IR_MINUS 0xFFE01F
-#define IR_PLUS 0xFFA857
-#define IR_0 0xFF6897
-#define IR_1 0xFF30CF
-#define IR_2 0xFF18E7
-#define IR_3 0xFF7A85
-#define IR_4 0xFF10EF
-#define IR_5 0xFF38C7
-#define IR_6 0xFF5AA5
-#define IR_7 0xFF42BD
-#define IR_8 0xFF4AB5
-#define IR_9 0xFF52AD
+// 红外键码定义（NEC格式）
+#define IR_DEC_PLAYER 0xBA45FF00      // 减少玩家数
+#define IR_RESET 0xB946FF00           // 重置为默认
+#define IR_INC_PLAYER 0xB847FF00      // 增加玩家数
+#define IR_INC_DECK 0xBB44FF00        // 增加牌组数
+#define IR_TOGGLE_JOKER 0xBF40FF00    // 切换鬼牌
+#define IR_START 0xBC43FF00           // 开始发牌
+#define IR_DEC_CIRCLE_TIME 0xF807FF00 // 减少圈时间100ms
+#define IR_INC_CIRCLE_TIME 0xEA15FF00 // 增加圈时间100ms
+#define IR_STOP 0xF609FF00            // 停止发牌
+#define IR_REMAIN_CARDS 0xE916FF00    // 调整剩余牌数
+#define IR_TEST_MOTOR_A 0xE619FF00    // 测试电机A旋转90度
+#define IR_TEST_MOTOR_B 0xF20DFF00    // 测试电机B
+#define IR_CALIBRATE 0xF30CFF00       // 校准罗盘
+#define IR_TOGGLE_MODE 0xE718FF00     // 切换模式（罗盘/超时）
+#define IR_SYSTEM_RESET 0xA15EFF00    // 系统重置
+#define IR_VERSION 0xF708FF00         // 版本显示
+#define IR_BTM 0xE31CFF00             // 减少物体存在超时时间
+#define IR_BTP 0xA55AFF00             // 增加物体存在超时时间
 #endif
 
 // ==================== 角度处理函数 ====================
 float normalizeAngle(float angle) {
-  // 将角度规范化到0-360度
-  while (angle >= 360.0) {
-    angle -= 360.0;
-  }
-  while (angle < 0.0) {
-    angle += 360.0;
-  }
+  while (angle >= 360.0) angle -= 360.0;
+  while (angle < 0.0) angle += 360.0;
   return angle;
 }
 
-// 计算角度差（带符号，正数表示需要逆时针旋转的角度）
 float getSimpleAngleDiff(float current, float target) {
-  // 计算最短路径角度差
   current = normalizeAngle(current);
   target = normalizeAngle(target);
-  
   float diff = target - current;
   
-  // 确保角度差在±180度范围内
-  if (diff > 180.0) {
-    diff -= 360.0;
-  } else if (diff < -180.0) {
-    diff += 360.0;
-  }
+  if (diff > 180.0) diff -= 360.0;
+  else if (diff < -180.0) diff += 360.0;
   
   return diff;
 }
 
 // ==================== TB6612FNG 电机控制函数 ====================
 void enableMotorDriver() {
-  // 使能TB6612FNG芯片
   digitalWrite(MOTOR_STBY, HIGH);
   delay(10);
 }
 
 void disableMotorDriver() {
-  // 禁用TB6612FNG芯片
   digitalWrite(MOTOR_STBY, LOW);
 }
 
 void stopAllMotors() {
-  // 使用TB6612FNG的刹车功能快速停止
-  // 电机A：刹车模式
   digitalWrite(MOTOR_A_IN1, HIGH);
   digitalWrite(MOTOR_A_IN2, HIGH);
-  analogWrite(MOTOR_A_PWM, 255);  // 刹车时PWM=255
+  analogWrite(MOTOR_A_PWM, 255);
   
-  // 电机B：刹车模式
   digitalWrite(MOTOR_B_IN1, HIGH);
   digitalWrite(MOTOR_B_IN2, HIGH);
   analogWrite(MOTOR_B_PWM, 255);
   
-  delay(50);  // 刹车时间
-  
-  // 然后完全关闭电机
+  delay(20);
   analogWrite(MOTOR_A_PWM, 0);
   analogWrite(MOTOR_B_PWM, 0);
   
   rotationInProgress = false;
 }
 
-// ==================== 电机A控制 ====================
 void controlMotorA(bool enable) {
   if (enable) {
-    // 电机A逆时针旋转: IN1=0, IN2=1
     digitalWrite(MOTOR_A_IN1, LOW);
     digitalWrite(MOTOR_A_IN2, HIGH);
     analogWrite(MOTOR_A_PWM, MOTOR_A_SPEED);
     rotationInProgress = true;
   } else {
-    // 快速停止电机A
-    digitalWrite(MOTOR_A_IN1, HIGH);
-    digitalWrite(MOTOR_A_IN2, HIGH);
-    analogWrite(MOTOR_A_PWM, 255);
-    delay(20);
-    analogWrite(MOTOR_A_PWM, 0);
-    rotationInProgress = false;
+    stopAllMotors();
   }
 }
 
-// 电机A全速旋转（用于校准）
 void controlMotorAFullSpeed() {
   digitalWrite(MOTOR_A_IN1, LOW);
   digitalWrite(MOTOR_A_IN2, HIGH);
@@ -261,12 +215,10 @@ void controlMotorAFullSpeed() {
 
 void controlMotorB(uint8_t state) {
   if (state) {
-    // 电机B正转: IN1=0, IN2=1
     digitalWrite(MOTOR_B_IN1, LOW);
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED);
   } else {
-    // 快速停止电机B
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, 255);
@@ -277,38 +229,29 @@ void controlMotorB(uint8_t state) {
 
 // ==================== 计算超时时间 ====================
 void calculateMotorATimeout() {
-  // 计算每个玩家角度的超时时间 = 一圈时间 / 玩家数
-  motorATimeoutPerPlayer = TIME_A_CIRCLE / playerCount;
+  motorATimeoutPerPlayer = MANUAL_CIRCLE_TIME / playerCount;
   
-  // 确保最小超时时间
-  if (motorATimeoutPerPlayer < 1000) {
-    motorATimeoutPerPlayer = 1000;
+  if (motorATimeoutPerPlayer < 100) {
+    motorATimeoutPerPlayer = 100;
   }
   
   #if DEBUG
-  Serial.print(F("Recalculated motorA timeout: "));
+  Serial.print(F("Circle time: "));
+  Serial.print(MANUAL_CIRCLE_TIME);
+  Serial.print(F("ms, Timeout: "));
   Serial.print(motorATimeoutPerPlayer);
-  Serial.print(F("ms (Circle time: "));
-  Serial.print(TIME_A_CIRCLE);
-  Serial.print(F("ms / Players: "));
-  Serial.print(playerCount);
-  Serial.println(F(")"));
+  Serial.print(F("ms"));
   #endif
 }
 
 // ==================== 罗盘读取函数 ====================
 bool readCompassHeading(float &heading) {
-  if (!compassInitialized) {
-    return false;
-  }
+  if (!compassInitialized) return false;
   
   compass.read();
   int rawHeading = compass.getAzimuth();
   
-  // 修正：处理负值航向
-  if (rawHeading < 0) {
-    rawHeading += 360;
-  }
+  if (rawHeading < 0) rawHeading += 360;
   
   if (rawHeading >= 0 && rawHeading <= 360) {
     heading = normalizeAngle(rawHeading + MAGNETIC_DECLINATION);
@@ -318,61 +261,28 @@ bool readCompassHeading(float &heading) {
   return false;
 }
 
-// ==================== 改进的虚拟角度跟踪 ====================
+// ==================== 虚拟角度跟踪 ====================
 float updateVirtualHeadingDuringRotation() {
   if (!rotationInProgress) return virtualHeading;
   
-  // 计算基于时间的虚拟旋转
   unsigned long currentTime = millis();
   unsigned long elapsed = currentTime - rotationStartTime;
   
-  // TB6612FNG更快：10秒/360° = 36°/秒
-  float rotationSpeed = 360.0 / (TIME_A_CIRCLE / 1000.0); // 度/秒
-  
-  // 计算应该旋转的角度
+  float rotationSpeed = 360.0 / (MANUAL_CIRCLE_TIME / 1000.0);
   float expectedRotation = (elapsed / 1000.0) * rotationSpeed;
-  
-  // 更新虚拟角度（逆时针旋转）
   virtualHeading = normalizeAngle(rotationStartHeading - expectedRotation);
   
   return virtualHeading;
 }
 
-// ==================== 改进的罗盘更新函数 ====================
+// ==================== 罗盘更新函数 ====================
 void updateCompassHeading() {
   if (!compassInitialized) return;
   
-  if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) {
-    return;
-  }
+  if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
   
   float newHeading;
   if (readCompassHeading(newHeading)) {
-    // 改进：检测非物理性跳变
-    static float lastRawHeading = newHeading;
-    float headingChange = fabs(newHeading - lastRawHeading);
-    
-    // 如果变化过大（>30°/采样周期），可能是干扰，使用虚拟角度
-    if (headingChange > 30.0 && rotationInProgress) {
-      // 电机正在运行时，变化率应该有限
-      #if DEBUG
-      static unsigned long lastJumpWarning = 0;
-      if (millis() - lastJumpWarning > 1000) {
-        Serial.print(F("Warning: Unphysical heading jump: "));
-        Serial.print(headingChange);
-        Serial.println(F("°"));
-        lastJumpWarning = millis();
-      }
-      #endif
-      
-      // 使用虚拟角度继续跟踪
-      virtualHeading = updateVirtualHeadingDuringRotation();
-      newHeading = virtualHeading;
-    } else {
-      lastRawHeading = newHeading;
-      virtualHeading = newHeading; // 更新虚拟角度
-    }
-    
     float change = fabs(newHeading - lastValidHeading);
     
     if (change > 0.5) {
@@ -388,18 +298,15 @@ void updateCompassHeading() {
     
     currentHeading = newHeading;
     lastValidHeading = newHeading;
+    virtualHeading = newHeading;
     headingSamples[sampleIndex] = newHeading;
     sampleIndex = (sampleIndex + 1) % 3;
     
-    if (!samplesReady && sampleIndex == 0) {
-      samplesReady = true;
-    }
+    if (!samplesReady && sampleIndex == 0) samplesReady = true;
     
     if (samplesReady) {
       float sum = 0;
-      for (int i = 0; i < 3; i++) {
-        sum += headingSamples[i];
-      }
+      for (int i = 0; i < 3; i++) sum += headingSamples[i];
       filteredHeading = normalizeAngle(sum / 3.0);
     } else {
       filteredHeading = newHeading;
@@ -412,36 +319,16 @@ void updateCompassHeading() {
 // ==================== 获取当前航向 ====================
 float getCurrentHeading() {
   if (compassInitialized && compassResponding) {
-    // 如果角度变化过快，使用虚拟角度
-    static float lastCompassReading = filteredHeading;
-    float currentReading = filteredHeading;
-    float changeRate = fabs(currentReading - lastCompassReading) / 
-                      (COMPASS_UPDATE_INTERVAL / 1000.0);
-    
-    if (rotationInProgress && changeRate > 60.0) { // 最大物理旋转速率假设
-      #if DEBUG
-      static unsigned long lastRateWarning = 0;
-      if (millis() - lastRateWarning > 2000) {
-        Serial.print(F("Using virtual heading - change rate too high: "));
-        Serial.println(changeRate);
-        lastRateWarning = millis();
-      }
-      #endif
-      lastCompassReading = currentReading;
-      return updateVirtualHeadingDuringRotation();
-    }
-    
-    lastCompassReading = currentReading;
     return filteredHeading;
   } else {
     return updateVirtualHeadingDuringRotation();
   }
 }
 
-// ==================== 终极版QMC5883L初始化 ====================
+// ==================== QMC5883L初始化 ====================
 bool initCompassUltimate() {
   #if DEBUG
-  Serial.println(F("=== QMC5883L ULTIMATE INITIALIZATION ==="));
+  Serial.println(F("Init Compass..."));
   #endif
   
   lcd.clear();
@@ -453,18 +340,14 @@ bool initCompassUltimate() {
   
   Wire.end();
   delay(50);
-  pinMode(A4, INPUT_PULLUP);
-  pinMode(A5, INPUT_PULLUP);
-  delay(50);
   Wire.begin();
   Wire.setClock(100000);
   delay(200);
   
   bool i2cConnected = false;
-  for (int attempt = 1; attempt <= 5; attempt++) {
+  for (int attempt = 1; attempt <= 3; attempt++) {
     Wire.beginTransmission(0x0D);
     byte error = Wire.endTransmission();
-    
     if (error == 0) {
       i2cConnected = true;
       break;
@@ -475,34 +358,14 @@ bool initCompassUltimate() {
   if (!i2cConnected) {
     lcd.clear();
     lcd.print(F("I2C Fail"));
-    lcd.setCursor(0, 1);
-    lcd.print(F("Check Wiring"));
     delay(2000);
     return false;
   }
-  
-  // 深度复位
-  Wire.end();
-  delay(10);
-  Wire.begin();
-  Wire.setClock(100000);
-  
-  for (int i = 0; i < 3; i++) {
-    Wire.beginTransmission(0x0D);
-    Wire.write(0x0A);
-    Wire.write(0x80);
-    Wire.endTransmission();
-    delay(10);
-  }
-  
-  delay(100);
   
   compass.init();
   delay(100);
   
   bool dataValid = false;
-  int successfulReadings = 0;
-  
   for (int i = 0; i < 5; i++) {
     compass.read();
     int x = compass.getX();
@@ -510,13 +373,13 @@ bool initCompassUltimate() {
     int z = compass.getZ();
     
     if (x != 0 || y != 0 || z != 0) {
-      successfulReadings++;
       dataValid = true;
+      break;
     }
     delay(50);
   }
   
-  compassInitialized = dataValid && (successfulReadings >= 3);
+  compassInitialized = dataValid;
   calibrationDone = false;
   
   if (compassInitialized) {
@@ -524,7 +387,7 @@ bool initCompassUltimate() {
     float headingSum = 0;
     int validHeadings = 0;
     
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 5; i++) {
       compass.read();
       int rawHeading = compass.getAzimuth();
       if (rawHeading >= 0 && rawHeading <= 360) {
@@ -544,18 +407,14 @@ bool initCompassUltimate() {
     virtualHeading = initialReading;
     lastValidHeading = initialReading;
     
-    for (int i = 0; i < 3; i++) {
-      headingSamples[i] = initialReading;
-    }
+    for (int i = 0; i < 3; i++) headingSamples[i] = initialReading;
     samplesReady = true;
-    
     compassResponding = true;
     noChangeCount = 0;
     
     #if DEBUG
-    Serial.print(F("Compass initialized successfully! Initial heading: "));
-    Serial.print(initialReading, 1);
-    Serial.println(F("°"));
+    Serial.print(F("Compass OK: "));
+    Serial.println(initialReading, 1);
     #endif
     
     lcd.clear();
@@ -566,12 +425,9 @@ bool initCompassUltimate() {
   return compassInitialized;
 }
 
-// ==================== 改进的校准函数（10秒全速旋转） ====================
+// ==================== 校准函数 ====================
 void calibrateCompass() {
   if (!compassInitialized) {
-    #if DEBUG
-    Serial.println(F("Cannot calibrate - compass not initialized"));
-    #endif
     lcd.clear();
     lcd.print(F("Compass Not Ready"));
     delay(1000);
@@ -580,25 +436,11 @@ void calibrateCompass() {
   
   lcd.clear();
   lcd.print(F("Calibrating..."));
-  lcd.setCursor(0, 1);
-  lcd.print(F("10s Full Speed"));
-  
-  #if DEBUG
-  Serial.println(F("Starting compass calibration..."));
-  Serial.println(F("Motor A will rotate at full speed for 10 seconds"));
-  #endif
   
   stopAllMotors();
   delay(200);
   enableMotorDriver();
   
-  unsigned long originalCircleTime = TIME_A_CIRCLE;
-  
-  // 设置全速旋转
-  TIME_A_CIRCLE = 5000;  // TB6612FNG更快，10秒一圈
-  calculateMotorATimeout();
-  
-  // 记录开始角度
   float startHeading = 0.0;
   for (int i = 0; i < 5; i++) {
     updateCompassHeading();
@@ -606,309 +448,121 @@ void calibrateCompass() {
   }
   startHeading = getCurrentHeading();
   
-  #if DEBUG
-  Serial.print(F("Start heading: "));
-  Serial.println(startHeading, 1);
-  #endif
-  
-  // 启动电机A全速旋转
   controlMotorAFullSpeed();
-  
-  unsigned long calibrationStartTime = millis();
-  unsigned long rotationDuration = 10000;  // 10秒校准时间（TB6612FNG更快）
-  unsigned long lastSampleTime = 0;
-  
-  int samples = 0;
-  int validSamples = 0;
-  float headingSum = 0;
-  float minHeading = 360.0;
-  float maxHeading = 0.0;
-  
-  while (millis() - calibrationStartTime < rotationDuration) {
-    updateCompassHeading();
-    
-    if (millis() - lastSampleTime >= 50) {
-      lastSampleTime = millis();
-      float currentHeading = getCurrentHeading();
-      samples++;
-      
-      if (samples > 5) {
-        validSamples++;
-        headingSum += currentHeading;
-        
-        if (currentHeading < minHeading) minHeading = currentHeading;
-        if (currentHeading > maxHeading) maxHeading = currentHeading;
-        
-        #if DEBUG
-        if (validSamples % 60 == 0) {
-          Serial.print(F("Calibration progress: "));
-          Serial.print((millis() - calibrationStartTime) * 100 / rotationDuration);
-          Serial.print(F("%"));
-          Serial.print(F(", Samples: "));
-          Serial.print(validSamples);
-          Serial.print(F(", Range: "));
-          float range = (maxHeading - minHeading > 180) ? (360 - minHeading + maxHeading) : (maxHeading - minHeading);
-          Serial.print(range, 1);
-          Serial.println(F("°"));
-        }
-        #endif
-        
-        if (validSamples % 10 == 0) {
-          lcd.setCursor(0, 1);
-          lcd.print(F("S:"));
-          lcd.print(validSamples);
-          float range = (maxHeading - minHeading > 180) ? (360 - minHeading + maxHeading) : (maxHeading - minHeading);
-          lcd.print(F(" R:"));
-          lcd.print((int)range);
-          lcd.print(F("°"));
-        }
-      }
-    }
-  }
+  delay(5000);
   
   stopAllMotors();
   delay(500);
   
-  float finalRange = 0.0;
-  if (maxHeading - minHeading > 180) {
-    finalRange = 360 - minHeading + maxHeading;
-  } else {
-    finalRange = maxHeading - minHeading;
+  float finalHeading = 0.0;
+  for (int i = 0; i < 5; i++) {
+    updateCompassHeading();
+    delay(100);
   }
+  finalHeading = getCurrentHeading();
+  
+  float avgHeading = normalizeAngle((startHeading + finalHeading) / 2.0);
+  
+  initialHeading = avgHeading;
+  currentHeading = avgHeading;
+  targetHeading = avgHeading;
+  filteredHeading = avgHeading;
+  virtualHeading = avgHeading;
+  lastValidHeading = avgHeading;
+  calibrationDone = true;
+  
+  for (int i = 0; i < 3; i++) headingSamples[i] = avgHeading;
   
   #if DEBUG
-  Serial.print(F("Calibration complete. Valid samples: "));
-  Serial.println(validSamples);
-  Serial.print(F("Min heading: "));
-  Serial.print(minHeading, 1);
-  Serial.print(F("°, Max heading: "));
-  Serial.print(maxHeading, 1);
-  Serial.print(F("°, Range: "));
-  Serial.print(finalRange, 1);
-  Serial.println(F("°"));
+  Serial.print(F("Calibration done: "));
+  Serial.println(avgHeading, 1);
   #endif
   
-  if (validSamples >= 80 && finalRange > 300.0) {  // 减少所需样本数，因为时间更短
-    float sumSin = 0.0;
-    float sumCos = 0.0;
-    
-    for (int i = 0; i < 10; i++) {
-      updateCompassHeading();
-      float h = getCurrentHeading() * DEG_TO_RAD;
-      sumSin += sin(h);
-      sumCos += cos(h);
-      delay(100);
-    }
-    
-    float avgRad = atan2(sumSin, sumCos);
-    float avgHeading = avgRad * RAD_TO_DEG;
-    if (avgHeading < 0) avgHeading += 360.0;
-    
-    initialHeading = normalizeAngle(avgHeading);
-    currentHeading = initialHeading;
-    targetHeading = initialHeading;
-    filteredHeading = initialHeading;
-    virtualHeading = initialHeading;
-    lastValidHeading = initialHeading;
-    calibrationDone = true;
-    
-    for (int i = 0; i < 3; i++) {
-      headingSamples[i] = initialHeading;
-    }
-    
-    #if DEBUG
-    Serial.print(F("Calibration successful! Samples: "));
-    Serial.println(validSamples);
-    Serial.print(F("Average heading: "));
-    Serial.print(avgHeading, 1);
-    Serial.println(F("°"));
-    Serial.print(F("Initial heading set to: "));
-    Serial.println(initialHeading, 1);
-    #endif
-    
-    lcd.clear();
-    lcd.print(F("Calibration OK!"));
-    lcd.setCursor(0, 1);
-    lcd.print(F("H:"));
-    lcd.print((int)initialHeading);
-    lcd.print(F(" R:"));
-    lcd.print((int)finalRange);
-    lcd.print(F("°"));
-  } else {
-    calibrationDone = false;
-    
-    #if DEBUG
-    Serial.print(F("Calibration failed - valid samples: "));
-    Serial.print(validSamples);
-    Serial.print(F(", range: "));
-    Serial.print(finalRange, 1);
-    Serial.println(F("° (need >300°)"));
-    #endif
-    
-    lcd.clear();
-    lcd.print(F("Calibration FAIL"));
-  }
+  lcd.clear();
+  lcd.print(F("Calibration OK"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("H:"));
+  lcd.print((int)avgHeading);
+  lcd.print(F("°"));
   
-  TIME_A_CIRCLE = originalCircleTime;
-  calculateMotorATimeout();
   delay(1500);
 }
 
-// ==================== 智能旋转控制 - 增强版 ====================
+// ==================== 核心：旋转控制函数 ====================
 bool rotateToAngle() {
-  if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) {
-    return false;
-  }
+  if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) return false;
   
   lastMotorUpdate = millis();
-  float current = getCurrentHeading();
-  float angleDiff = getSimpleAngleDiff(current, targetHeading);
   unsigned long elapsed = millis() - aMotorTimeoutStart;
   
-  // 新增：计算期望的最小旋转时间
-  float requiredRotation = fabs(getSimpleAngleDiff(rotationStartHeading, targetHeading));
-  float minRotationTime = (requiredRotation / 360.0) * TIME_A_CIRCLE * 0.6; // 60%的理论时间（TB6612FNG更快）
-  
-  #if DEBUG
-  static unsigned long lastRotateDebug = 0;
-  if (millis() - lastRotateDebug > 300) {
-    Serial.print(F("Rotation: current="));
-    Serial.print(current, 1);
-    Serial.print(F("°, target="));
-    Serial.print(targetHeading, 1);
-    Serial.print(F("°, diff="));
-    Serial.print(angleDiff, 1);
-    Serial.print(F("°, elapsed="));
-    Serial.print(elapsed);
-    Serial.print(F("ms, minTime="));
-    Serial.print((int)minRotationTime);
-    Serial.print(F("ms"));
+  if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
+    float current = getCurrentHeading();
+    float angleDiff = getSimpleAngleDiff(current, targetHeading);
     
-    if (compassInitialized && compassResponding && calibrationDone) {
-      Serial.print(F(", Mode: Compass"));
-    } else {
-      Serial.print(F(", Mode: Timeout"));
+    if (fabs(angleDiff) <= angleTolerance) {
+      stopAllMotors();
+      return true;
     }
     
-    Serial.println();
-    lastRotateDebug = millis();
-  }
-  #endif
-  
-  bool shouldStop = false;
-  
-  // 模式1：罗盘模式
-  if (compassInitialized && compassResponding && calibrationDone) {
-    // 新增条件：必须旋转至少最小时间
-    if (fabs(angleDiff) <= angleTolerance && elapsed > 800 && elapsed > minRotationTime) {
-      shouldStop = true;
-      #if DEBUG
-      Serial.print(F("✓ Target reached! Angle diff="));
-      Serial.print(fabs(angleDiff), 1);
-      Serial.print(F("°, minTime met: "));
-      Serial.print(elapsed);
-      Serial.print(F("ms > "));
-      Serial.print((int)minRotationTime);
-      Serial.println(F("ms"));
-      #endif
+    if (elapsed >= motorATimeoutPerPlayer) {
+      stopAllMotors();
+      return true;
     }
-  } 
-  
-  // 条件2：超时（稍微放宽）
-  if (elapsed >= motorATimeoutPerPlayer * 1.2) { // 增加20%余量
-    shouldStop = true;
-    #if DEBUG
-    Serial.print(F("⏱ Rotation timeout after "));
-    Serial.print(elapsed);
-    Serial.print(F("ms (expected: "));
-    Serial.print(motorATimeoutPerPlayer);
-    Serial.println(F("ms)"));
-    #endif
-  }
-  
-  if (shouldStop) {
-    stopAllMotors();
     
-    #if DEBUG
-    float finalAngle = getCurrentHeading();
-    float actualRotation = getSimpleAngleDiff(rotationStartHeading, finalAngle);
-    Serial.print(F("Rotation complete: started at "));
-    Serial.print(rotationStartHeading, 1);
-    Serial.print(F("°, ended at "));
-    Serial.print(finalAngle, 1);
-    Serial.print(F("°, rotated "));
-    Serial.print(actualRotation, 1);
-    Serial.print(F("° in "));
-    Serial.print(elapsed);
-    Serial.println(F("ms"));
-    #endif
-    
-    return true;
+    controlMotorA(true);
+    return false;
   }
-  
-  // 继续逆时针旋转
-  controlMotorA(true);
-  return false;
+  else {
+    if (elapsed >= motorATimeoutPerPlayer) {
+      stopAllMotors();
+      return true;
+    }
+    
+    float expectedRotation = (elapsed / (float)MANUAL_CIRCLE_TIME) * 360.0;
+    float targetRotation = fabs(getSimpleAngleDiff(rotationStartHeading, targetHeading));
+    
+    if (expectedRotation >= targetRotation * 0.95 && elapsed > motorATimeoutPerPlayer * 0.8) {
+      stopAllMotors();
+      return true;
+    }
+    
+    controlMotorA(true);
+    return false;
+  }
 }
 
-// ==================== 关键修正：障碍事件处理 ====================
-void handleObstacleEvent() {
-  lastObstacleTime = millis();
-  
+// ==================== 物体离开事件处理 ====================
+void handleObjectLeaveEvent() {
+  // 停止所有电机
   stopAllMotors();
+  
+  // 更新发牌计数
   dealtCards++;
   if (dealtCards > totalCards) dealtCards = totalCards;
   
   #if DEBUG
-  Serial.print(F("Obstacle detected, dealt: "));
+  Serial.print(F("Object left, card dealt: "));
   Serial.println(dealtCards);
+  Serial.print(F("Object present duration: "));
+  Serial.print(objectLeaveTime - objectDetectedTime);
+  Serial.println(F("ms"));
   #endif
   
-  // 计算目标角度 - 关键修正！
+  // 计算下一个玩家的目标角度
   uint8_t currentPlayerIndex = dealtCards % playerCount;
-  
-  // 关键修改：罗盘是顺时针增加角度，但电机是逆时针旋转
-  // 所以目标角度应该是递减：initialHeading - playerIndex * anglePerPlayer
   float targetAngle = initialHeading - (currentPlayerIndex * anglePerPlayer);
-  
-  // 规范化角度到0-360度
   targetHeading = normalizeAngle(targetAngle);
   
-  #if DEBUG
-  Serial.print(F("Player index: "));
-  Serial.print(currentPlayerIndex);
-  Serial.print(F(", New target heading: "));
-  Serial.println(targetHeading, 1);
-  Serial.print(F("Calculation: "));
-  Serial.print(initialHeading, 1);
-  Serial.print(F(" - ("));
-  Serial.print(currentPlayerIndex);
-  Serial.print(F(" * "));
-  Serial.print(anglePerPlayer, 1);
-  Serial.print(F(") = "));
-  Serial.print(targetAngle, 1);
-  Serial.print(F(" -> Normalized: "));
-  Serial.println(targetHeading, 1);
-  #endif
-  
-  // 记录旋转开始时的角度和时间
-  for (int i = 0; i < 3; i++) {
-    updateCompassHeading();
-    delay(50);
-  }
+  // 准备旋转
   rotationStartHeading = getCurrentHeading();
-  rotationStartTime = millis(); // 记录旋转开始时间
-  
-  // 重置虚拟角度到当前实际角度
+  rotationStartTime = millis();
   virtualHeading = rotationStartHeading;
   
+  // 开始旋转到下一个玩家
   changeState(STATE_A_RUNNING);
   aMotorTimeoutStart = millis();
   lastMotorUpdate = millis();
   
-  // 开始旋转
-  motorA_lastHeading = getCurrentHeading();
-  motorA_lastCheckTime = millis();
   controlMotorA(true);
   
   // 重置罗盘响应状态
@@ -916,8 +570,9 @@ void handleObstacleEvent() {
   noChangeCount = 0;
   lastHeadingChangeTime = millis();
   
-  showStatusMessage("Card Detected");
+  showStatusMessage("Rotating...");
   
+  // 如果已经发完所有牌，停止发牌
   if (dealtCards >= totalCards && totalCards > 0) {
     stopDealing();
     showStatusMessage("All Done!");
@@ -929,18 +584,20 @@ void handleObstacleEvent() {
 // ==================== 状态切换 ====================
 void changeState(SystemState newState) {
   #if DEBUG
-  const char* stateNames[] = {"IDLE", "B_RUNNING", "A_RUNNING", "B_TIMEOUT"};
+  const char* stateNames[] = {"IDLE", "B_RUNNING", "A_RUNNING", "B_TIMEOUT", "OBJECT_DETECTED"};
   if (currentState != newState) {
-    Serial.print(F("State change: "));
+    Serial.print(F("State: "));
     Serial.print(stateNames[currentState]);
     Serial.print(F(" -> "));
     Serial.println(stateNames[newState]);
   }
   #endif
   
-  if (newState != STATE_B_RUNNING) {
+  if (newState != STATE_B_RUNNING && newState != STATE_OBJECT_DETECTED) {
     obstacleTriggered = false;
     obstacleActive = false;
+    obstacleDetected = false;
+    waitingForObjectLeave = false;
   }
   
   currentState = newState;
@@ -961,42 +618,23 @@ void startDealing() {
   stopAllMotors();
   enableMotorDriver();
   
-  if (compassInitialized && calibrationDone) {
-    // 等待罗盘稳定
-    for (int i = 0; i < 10; i++) {
-      updateCompassHeading();
-      delay(50);
-    }
-    
-    // 使用校准时的初始航向，不重新获取
+  if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
     targetHeading = initialHeading;
     virtualHeading = initialHeading;
-    
-    #if DEBUG
-    Serial.print(F("Start dealing with calibrated heading: "));
-    Serial.println(initialHeading, 1);
-    Serial.print(F("Motor timeout per player: "));
-    Serial.print(motorATimeoutPerPlayer);
-    Serial.println(F("ms"));
-    #endif
   } else {
-    // 使用超时模式
     initialHeading = 0;
     currentHeading = 0;
     virtualHeading = 0;
     targetHeading = 0;
-    
-    #if DEBUG
-    Serial.println(F("Start dealing in timeout mode"));
-    Serial.print(F("Timeout per player: "));
-    Serial.print(motorATimeoutPerPlayer);
-    Serial.println(F("ms"));
-    #endif
   }
   
   changeState(STATE_B_RUNNING);
   motorStartTime = millis();
   controlMotorB(1);
+  
+  // 重置物体检测状态
+  obstacleDetected = false;
+  waitingForObjectLeave = false;
   
   showStatusMessage("Start Dealing");
   delay(300);
@@ -1006,50 +644,100 @@ void stopDealing() {
   isRunning = 0;
   changeState(STATE_IDLE);
   stopAllMotors();
-  
   updateDisplay();
-  
-  #if DEBUG
-  Serial.println(F("Stop dealing"));
-  #endif
 }
 
 // ==================== 避障检测 ====================
 void checkObstacle() {
   uint8_t newState = digitalRead(OBSTACLE_PIN);
   
-  if (currentState != STATE_B_RUNNING) {
-    lastObstacleState = newState;
-    obstacleState = newState;
-    return;
-  }
-  
+  // 状态变化检测
   if (newState != lastObstacleState) {
     obstacleDebounce = millis();
   }
   
+  // 防抖处理
   if (millis() - obstacleDebounce > 50) {
     if (newState != obstacleState) {
       obstacleState = newState;
-    }
-    
-    if (obstacleState == LOW && (millis() - lastObstacleTime > 500)) {
-      handleObstacleEvent();
+      
+      #if DEBUG
+      Serial.print(F("Obstacle state: "));
+      Serial.println(obstacleState == LOW ? "LOW (object)" : "HIGH (clear)");
+      #endif
+      
+      // 处理状态变化
+      if (currentState == STATE_B_RUNNING) {
+        if (obstacleState == LOW) {
+          // 检测到物体 - 记录时间但不立即停止
+          objectDetectedTime = millis();
+          obstacleDetected = true;
+          waitingForObjectLeave = true;
+          changeState(STATE_OBJECT_DETECTED);
+          
+          #if DEBUG
+          Serial.println(F("Object detected, waiting for leave..."));
+          #endif
+          
+          showStatusMessage("Object Detected");
+        }
+      } else if (currentState == STATE_OBJECT_DETECTED) {
+        if (obstacleState == HIGH) {
+          // 物体离开 - 停止电机B并旋转到下一个玩家
+          objectLeaveTime = millis();
+          obstacleDetected = false;
+          waitingForObjectLeave = false;
+          
+          // 处理发牌事件
+          handleObjectLeaveEvent();
+        }
+      }
     }
   }
   
   lastObstacleState = newState;
+  
+  // 检查物体存在超时（防止物体一直挡住传感器）
+  if (currentState == STATE_OBJECT_DETECTED && obstacleState == LOW) {
+    if (millis() - objectDetectedTime > objectPresentTimeout) {
+      #if DEBUG
+      Serial.println(F("Object presence timeout, forcing leave"));
+      #endif
+      
+      // 强制处理为物体离开
+      objectLeaveTime = millis();
+      obstacleDetected = false;
+      waitingForObjectLeave = false;
+      
+      handleObjectLeaveEvent();
+    }
+  }
 }
 
 // ==================== 状态处理函数 ====================
 void handleMotorState() {
   switch (currentState) {
     case STATE_B_RUNNING:
-      if (millis() - motorStartTime > 5000) {  // B电机超时5秒
+      if (millis() - motorStartTime > 5000) {
         changeState(STATE_B_TIMEOUT);
         showStatusMessage("B Timeout!");
         delay(500);
         stopDealing();
+      }
+      break;
+      
+    case STATE_OBJECT_DETECTED:
+      // 物体被检测到，但还未离开
+      // 保持电机B转动，等待物体离开
+      if (millis() - objectDetectedTime > objectPresentTimeout) {
+        // 物体存在超时，强制处理
+        #if DEBUG
+        Serial.println(F("Object presence timeout in handleMotorState"));
+        #endif
+        handleObjectLeaveEvent();
+      } else {
+        // 保持电机B转动
+        controlMotorB(1);
       }
       break;
       
@@ -1072,28 +760,67 @@ void handleMotorState() {
   }
 }
 
+// ==================== 系统重启函数 ====================
+void resetSystem() {
+  #if DEBUG
+  Serial.println(F("System Reset"));
+  #endif
+  
+  stopAllMotors();
+  disableMotorDriver();
+  
+  isRunning = 0;
+  dealtCards = 0;
+  currentState = STATE_IDLE;
+  obstacleTriggered = false;
+  obstacleActive = false;
+  obstacleDetected = false;
+  waitingForObjectLeave = false;
+  
+  if (compassInitialized) {
+    float current = getCurrentHeading();
+    currentHeading = current;
+    targetHeading = current;
+    virtualHeading = current;
+    lastValidHeading = current;
+    filteredHeading = current;
+  }
+  
+  serialBufferIndex = 0;
+  serialBuffer[0] = '\0';
+  
+  lcd.clear();
+  lcd.print(F("System Reset"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Mode: "));
+  lcd.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+  
+  delay(1000);
+  updateDisplay();
+}
+
 // ==================== 红外遥控处理 ====================
 #if ENABLE_INFRA
 void processInfraredInput() {
   if (IrReceiver.decode()) {
     unsigned long irValue = IrReceiver.decodedIRData.decodedRawData;
     
-    #if DEBUG
+    #if IR_DEBUG
+    // 始终打印接收到的红外键码，便于调试
     Serial.print(F("IR Received: 0x"));
     Serial.println(irValue, HEX);
     #endif
     
-    // 根据红外键码执行相应操作
+    // 处理重复码
+    if (irValue == 0xFFFFFFFF) {
+      irValue = IrReceiver.decodedIRData.decodedRawData;
+      #if IR_DEBUG
+      Serial.println(F("IR Repeat"));
+      #endif
+    }
+    
     switch(irValue) {
-      case IR_PLAY_PAUSE:  // 播放/暂停键
-        if (!isRunning) {
-          startDealing();
-        } else {
-          stopDealing();
-        }
-        break;
-        
-      case IR_PREV:  // 上一曲键 - 减少玩家数量
+      case IR_DEC_PLAYER:  // 减少玩家数 (FFA25D)
         if (!isRunning) {
           if (playerCount > 2) playerCount--;
           else playerCount = 8;
@@ -1103,24 +830,7 @@ void processInfraredInput() {
         }
         break;
         
-      case IR_NEXT:  // 下一曲键 - 增加玩家数量
-        if (!isRunning) {
-          playerCount++;
-          if (playerCount > 8) playerCount = 2;
-          anglePerPlayer = 360.0 / playerCount;
-          calculateMotorATimeout();
-          updateDisplay();
-        }
-        break;
-        
-      case IR_0:  // 数字0 - 校准罗盘
-        if (!isRunning && compassInitialized) {
-          calibrateCompass();
-          updateDisplay();
-        }
-        break;
-        
-      case IR_1:  // 数字1 - 重置到默认
+      case IR_RESET:  // 重置为默认 (FF629D)
         if (!isRunning) {
           playerCount = 4;
           deckCount = 3;
@@ -1133,15 +843,17 @@ void processInfraredInput() {
         }
         break;
         
-      case IR_2:  // 数字2 - 切换有无王
+      case IR_INC_PLAYER:  // 增加玩家数 (FFE21D)
         if (!isRunning) {
-          hasJokers = !hasJokers;
-          totalCards = deckCount * (hasJokers ? 54 : 52);
+          playerCount++;
+          if (playerCount > 8) playerCount = 2;
+          anglePerPlayer = 360.0 / playerCount;
+          calculateMotorATimeout();
           updateDisplay();
         }
         break;
         
-      case IR_3:  // 数字3 - 增加牌组
+      case IR_INC_DECK:  // 增加牌组数 (FF22DD)
         if (!isRunning) {
           deckCount++;
           if (deckCount > 3) deckCount = 1;
@@ -1150,32 +862,212 @@ void processInfraredInput() {
         }
         break;
         
-      case IR_PLUS:  // +键 - 测试电机A
+      case IR_TOGGLE_JOKER:  // 切换鬼牌 (FF02FD)
         if (!isRunning) {
-          enableMotorDriver();
-          controlMotorA(true);
-          lcd.clear();
-          lcd.print(F("Motor A Test"));
-          delay(1000);
-          stopAllMotors();
+          hasJokers = !hasJokers;
+          totalCards = deckCount * (hasJokers ? 54 : 52);
           updateDisplay();
         }
         break;
         
-      case IR_MINUS:  // -键 - 测试电机B
+      case IR_START:  // 开始发牌 (FFC23D)
+        if (!isRunning) {
+          startDealing();
+        } else {
+          showStatusMessage("Already Running");
+        }
+        break;
+        
+      case IR_DEC_CIRCLE_TIME:  // 减少圈时间100ms (FFE01F)
+        if (!isRunning && MANUAL_CIRCLE_TIME > 200) {
+          MANUAL_CIRCLE_TIME -= 100;
+          calculateMotorATimeout();
+          lcd.clear();
+          lcd.print(F("Circle Time -100"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("T="));
+          lcd.print(MANUAL_CIRCLE_TIME);
+          lcd.print(F("ms"));
+          delay(1000);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_INC_CIRCLE_TIME:  // 增加圈时间100ms (FFA857)
+        if (!isRunning) {
+          MANUAL_CIRCLE_TIME += 100;
+          calculateMotorATimeout();
+          lcd.clear();
+          lcd.print(F("Circle Time +100"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("T="));
+          lcd.print(MANUAL_CIRCLE_TIME);
+          lcd.print(F("ms"));
+          delay(1000);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_STOP:  // 停止发牌 (FF906F)
+        if (isRunning) {
+          stopDealing();
+        } else {
+          lcd.clear();
+          lcd.print(F("Not Running"));
+          delay(1000);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_REMAIN_CARDS:  // 调整剩余牌数 (FF6897)
+        if (!isRunning) {
+          remainCards += playerCount;
+          if (remainCards > playerCount * 4) remainCards = 0;
+          totalCards = deckCount * (hasJokers ? 54 : 52);
+          if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
+          updateDisplay();
+        }
+        break;
+      /*  
+      case IR_TEST_MOTOR_A:  // 测试电机A旋转90度 (FF9867)
+        if (!isRunning) {
+          enableMotorDriver();
+          float startAngle = getCurrentHeading();
+          float testTarget = normalizeAngle(startAngle - 90);
+          
+          lcd.clear();
+          lcd.print(F("Test 90 Rotation"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("Mode: "));
+          lcd.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+          
+          rotationStartHeading = startAngle;
+          rotationStartTime = millis();
+          aMotorTimeoutStart = millis();
+          targetHeading = testTarget;
+          
+          unsigned long expectedTime = (90.0 / 360.0) * MANUAL_CIRCLE_TIME;
+          
+          #if DEBUG
+          Serial.print(F("90 test: "));
+          Serial.print(expectedTime);
+          Serial.println(F("ms"));
+          #endif
+          
+          controlMotorA(true);
+          
+          unsigned long testStart = millis();
+          bool testComplete = false;
+          
+          while (!testComplete && millis() - testStart < 10000) {
+            if (rotateToAngle()) {
+              testComplete = true;
+            }
+            delay(10);
+          }
+          
+          if (!testComplete) {
+            stopAllMotors();
+          }
+          
+          float endAngle = getCurrentHeading();
+          float actualRotation = getSimpleAngleDiff(startAngle, endAngle);
+          
+          lcd.clear();
+          lcd.print(F("Test Complete"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("Rotated: "));
+          lcd.print(actualRotation, 0);
+          lcd.print(F("°"));
+          
+          delay(2000);
+          updateDisplay();
+        }
+        break;
+      */  
+      case IR_TEST_MOTOR_B:  // 测试电机B (FFB04F)
         if (!isRunning) {
           enableMotorDriver();
           controlMotorB(1);
           lcd.clear();
           lcd.print(F("Motor B Test"));
-          delay(1000);
+          delay(1500);
           stopAllMotors();
           updateDisplay();
         }
         break;
+        
+      case IR_CALIBRATE:  // 校准罗盘 (FF30CF)
+        if (!isRunning && compassInitialized) {
+          calibrateCompass();
+          updateDisplay();
+        }
+        break;
+        
+      case IR_TOGGLE_MODE:  // 切换模式（罗盘/超时） (FF18E7)
+        runtimeTurnaroundMode = !runtimeTurnaroundMode;
+        lcd.clear();
+        lcd.print(F("Mode Changed"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Now: "));
+        lcd.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+        delay(1000);
+        updateDisplay();
+        
+        #if DEBUG
+        Serial.print(F("Mode: "));
+        Serial.println(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+        #endif
+        break;
+        
+      case IR_SYSTEM_RESET:  // 系统重置 (FF7A85)
+        resetSystem();
+        break;
+        
+      case IR_VERSION:  // 版本显示 (FF10EF)
+        lcd.clear();
+        lcd.print(F("Card Dealer v28.0"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Manual Calibration"));
+        delay(1000);
+        updateDisplay();
+        break;
+        
+      case IR_BTP:  // 增加物体存在超时时间
+        if (!isRunning) {
+          objectPresentTimeout += 500;  // 增加0.5秒
+          if (objectPresentTimeout > 5000) objectPresentTimeout = 2000;  // 最大5秒，最小2秒
+          lcd.clear();
+          lcd.print(F("Obj Timeout: "));
+          lcd.print(objectPresentTimeout / 1000.0, 1);
+          lcd.print(F("s"));
+          delay(1000);
+          updateDisplay();
+        }
+        break;
+        
+      case IR_BTM:  // 减少物体存在超时时间
+        if (!isRunning) {
+          objectPresentTimeout -= 500;  // 减少0.5秒
+          if (objectPresentTimeout < 1000) objectPresentTimeout = 1000;  // 最小1秒
+          lcd.clear();
+          lcd.print(F("Obj Timeout: "));
+          lcd.print(objectPresentTimeout / 1000.0, 1);
+          lcd.print(F("s"));
+          delay(1000);
+          updateDisplay();
+        }
+        break;
+        
+      default:
+        #if IR_DEBUG
+        Serial.print(F("Unknown IR: 0x"));
+        Serial.println(irValue, HEX);
+        #endif
+        break;
     }
     
-    IrReceiver.resume();  // 准备接收下一个红外信号
+    IrReceiver.resume();
   }
 }
 #endif
@@ -1191,7 +1083,7 @@ void processSerialInput() {
         serialBuffer[serialBufferIndex] = '\0';
         
         #if DEBUG
-        Serial.print(F("Received command: "));
+        Serial.print(F("Cmd: "));
         Serial.println(serialBuffer);
         #endif
         
@@ -1212,23 +1104,43 @@ void processSerialInput() {
 // ==================== 串口命令处理函数 ====================
 void handleSerialCommand(const char* command) {
   #if ENABLE_KEYBOARD
-  lcd.setCursor(14, 1);
-  if (command[0] < 0x10) lcd.print(F("0"));
-  lcd.print(command[0], HEX);
+  // 处理数字命令（设置圈时间）
+  if (command[0] >= '0' && command[0] <= '9') {
+    long timeValue = atol(command);
+    if (timeValue >= 100 && timeValue <= 10000) {
+      MANUAL_CIRCLE_TIME = timeValue;
+      calculateMotorATimeout();
+      
+      lcd.clear();
+      lcd.print(F("Circle Time Set"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("T="));
+      lcd.print(MANUAL_CIRCLE_TIME);
+      lcd.print(F("ms"));
+      
+      #if DEBUG
+      Serial.print(F("Circle time: "));
+      Serial.print(MANUAL_CIRCLE_TIME);
+      Serial.println(F("ms"));
+      #endif
+      
+      delay(1500);
+      updateDisplay();
+      return;
+    }
+  }
   
   switch(command[0]) {
-    case 'v':  // 版本显示
-    case 'V':
+    case 'v': case 'V':
       lcd.clear();
-      lcd.print(F("Card Dealer v25.1"));
+      lcd.print(F("Card Dealer v28.0"));
       lcd.setCursor(0, 1);
-      lcd.print(F("All-in-One Setup"));
+      lcd.print(F("Manual Calibration"));
       delay(1000);
       updateDisplay();
       break;
       
-    case 'p':  // 增加玩家数量
-    case 'P':
+    case 'p': case 'P':
       playerCount++;
       if (playerCount > 8) playerCount = 2;
       anglePerPlayer = 360.0 / playerCount;
@@ -1236,25 +1148,20 @@ void handleSerialCommand(const char* command) {
       updateDisplay();
       break;
       
-    case 'd':  // 增加牌组数量
-    case 'D':
+    case 'd': case 'D':
       deckCount++;
       if (deckCount > 3) deckCount = 1;
       totalCards = deckCount * (hasJokers ? 54 : 52);
-      if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
       updateDisplay();
       break;
       
-    case 'j':  // 切换是否有王
-    case 'J':
+    case 'j': case 'J':
       hasJokers = !hasJokers;
       totalCards = deckCount * (hasJokers ? 54 : 52);
-      if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
       updateDisplay();
       break;
       
-    case 'r':  // 调整剩余牌数
-    case 'R':
+    case 'r': case 'R':
       remainCards += playerCount;
       if (remainCards > playerCount * 4) remainCards = 0;
       totalCards = deckCount * (hasJokers ? 54 : 52);
@@ -1262,19 +1169,12 @@ void handleSerialCommand(const char* command) {
       updateDisplay();
       break;
       
-    case 's':  // 开始发牌
-    case 'S':
-      if (!isRunning) {
-        startDealing();
-      } else {
-        showStatusMessage("Already Running");
-        delay(500);
-        updateDisplay();
-      }
+    case 's': case 'S':
+      if (!isRunning) startDealing();
+      else showStatusMessage("Already Running");
       break;
       
-    case 'c':  // 重置到默认
-    case 'C':
+    case 'c': case 'C':
       playerCount = 4;
       deckCount = 3;
       hasJokers = 1;
@@ -1286,13 +1186,9 @@ void handleSerialCommand(const char* command) {
       updateDisplay();
       break;
       
-    case 't':  // 停止发牌
-    case 'T':
-      if (isRunning) {
-        stopDealing();
-        delay(500);
-        updateDisplay();
-      } else {
+    case 't': case 'T':
+      if (isRunning) stopDealing();
+      else {
         stopAllMotors();
         disableMotorDriver();
         changeState(STATE_IDLE);
@@ -1302,34 +1198,31 @@ void handleSerialCommand(const char* command) {
         updateDisplay();
       }
       break;
-      
-    case 'a':  // 测试电机A旋转90度
-    case 'A':
+    /*  
+    case 'a': case 'A':
       if (!isRunning) {
         enableMotorDriver();
         float startAngle = getCurrentHeading();
-        float testTarget = normalizeAngle(startAngle - 90);  // 逆时针旋转
+        float testTarget = normalizeAngle(startAngle - 90);
         
         lcd.clear();
-        lcd.print(F("Test 90° Rotation"));
+        lcd.print(F("Test 90 Rotation"));
         lcd.setCursor(0, 1);
-        lcd.print(F("Start:"));
-        lcd.print((int)startAngle);
-        lcd.print(F("->"));
-        lcd.print((int)testTarget);
-        
-        #if DEBUG
-        Serial.println(F("=== 90° Rotation Test ==="));
-        Serial.print(F("Start angle: "));
-        Serial.println(startAngle, 1);
-        Serial.print(F("Target angle: "));
-        Serial.println(testTarget, 1);
-        #endif
+        lcd.print(F("Mode: "));
+        lcd.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
         
         rotationStartHeading = startAngle;
         rotationStartTime = millis();
         aMotorTimeoutStart = millis();
         targetHeading = testTarget;
+        
+        unsigned long expectedTime = (90.0 / 360.0) * MANUAL_CIRCLE_TIME;
+        
+        #if DEBUG
+        Serial.print(F("90 test: "));
+        Serial.print(expectedTime);
+        Serial.println(F("ms"));
+        #endif
         
         controlMotorA(true);
         
@@ -1337,89 +1230,125 @@ void handleSerialCommand(const char* command) {
         bool testComplete = false;
         
         while (!testComplete && millis() - testStart < 10000) {
-          float current = getCurrentHeading();
-          float diff = getSimpleAngleDiff(current, testTarget);
-          float requiredRotation = fabs(getSimpleAngleDiff(startAngle, testTarget));
-          float minRotationTime = (requiredRotation / 360.0) * TIME_A_CIRCLE * 0.6;
-          
-          if ((fabs(diff) <= angleTolerance && (millis() - aMotorTimeoutStart > minRotationTime)) || 
-              (millis() - aMotorTimeoutStart >= motorATimeoutPerPlayer)) {
+          if (rotateToAngle()) {
             testComplete = true;
-            stopAllMotors();
-            
-            float endAngle = getCurrentHeading();
-            float actualRotation = getSimpleAngleDiff(startAngle, endAngle);
-            
-            #if DEBUG
-            Serial.print(F("Test complete! Final angle: "));
-            Serial.print(endAngle, 1);
-            Serial.print(F("°, Total rotation: "));
-            Serial.print(actualRotation, 1);
-            Serial.print(F("°, Time: "));
-            Serial.print(millis() - testStart);
-            Serial.println(F("ms"));
-            #endif
-            
-            lcd.clear();
-            lcd.print(F("Test Complete"));
-            lcd.setCursor(0, 1);
-            lcd.print(F("Rotated: "));
-            lcd.print(actualRotation, 0);
-            lcd.print(F("°"));
           }
-          
-          updateCompassHeading();
-          delay(100);
+          delay(10);
         }
+        
+        if (!testComplete) {
+          stopAllMotors();
+        }
+        
+        float endAngle = getCurrentHeading();
+        float actualRotation = getSimpleAngleDiff(startAngle, endAngle);
+        
+        lcd.clear();
+        lcd.print(F("Test Complete"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Rotated: "));
+        lcd.print(actualRotation, 0);
+        lcd.print(F("°"));
         
         delay(2000);
         updateDisplay();
       }
       break;
       
-    case 'b':  // 测试电机B
-    case 'B':
+    case 'b': case 'B':
       if (!isRunning) {
         enableMotorDriver();
         controlMotorB(1);
         lcd.clear();
-        lcd.print(F("Motor B ON Test"));
-        delay(1500);
+        lcd.print(F("Motor B Test"));
+        delay(8000);
         stopAllMotors();
         updateDisplay();
       }
       break;
-      
-    case 'l':  // 校准电子罗盘
-    case 'L':
+    */  
+    case 'l': case 'L':
       if (!isRunning && compassInitialized) {
         calibrateCompass();
         updateDisplay();
       }
       break;
       
-    case 'h':  // 显示帮助信息
-    case 'H':
-      Serial.println(F("=== Card Dealer Commands v25.1 ==="));
-      Serial.println(F("V - Version display"));
-      Serial.println(F("P - Increase player count"));
-      Serial.println(F("D - Increase deck count"));
+    case 'm': case 'M':
+      runtimeTurnaroundMode = !runtimeTurnaroundMode;
+      lcd.clear();
+      lcd.print(F("Mode Changed"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Now: "));
+      lcd.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+      delay(1000);
+      updateDisplay();
+      
+      #if DEBUG
+      Serial.print(F("Mode: "));
+      Serial.println(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+      #endif
+      break;
+      
+    case 'z': case 'Z':
+      resetSystem();
+      break;
+      
+    case '+':
+      MANUAL_CIRCLE_TIME += 100;
+      calculateMotorATimeout();
+      lcd.clear();
+      lcd.print(F("Circle Time +100"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("T="));
+      lcd.print(MANUAL_CIRCLE_TIME);
+      lcd.print(F("ms"));
+      delay(1000);
+      updateDisplay();
+      break;
+      
+    case '-':
+      if (MANUAL_CIRCLE_TIME > 200) {
+        MANUAL_CIRCLE_TIME -= 100;
+        calculateMotorATimeout();
+        lcd.clear();
+        lcd.print(F("Circle Time -100"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("T="));
+        lcd.print(MANUAL_CIRCLE_TIME);
+        lcd.print(F("ms"));
+        delay(1000);
+        updateDisplay();
+      }
+      break;
+      
+    case 'h': case 'H':
+      Serial.println(F("=== Card Dealer Commands ==="));
+      Serial.println(F("V - Version"));
+      Serial.println(F("P - Increase players"));
+      Serial.println(F("D - Increase decks"));
       Serial.println(F("J - Toggle jokers"));
-      Serial.println(F("R - Adjust remaining cards"));
+      Serial.println(F("R - Adjust remaining"));
       Serial.println(F("S - Start dealing"));
       Serial.println(F("C - Reset to default"));
       Serial.println(F("T - Stop dealing"));
-      Serial.println(F("A - Test Motor A 90° rotation"));
+      Serial.println(F("A - Test Motor A 90°"));
       Serial.println(F("B - Test Motor B"));
       Serial.println(F("L - Calibrate compass"));
+      Serial.println(F("M - Toggle mode"));
+      Serial.println(F("Z - System reset"));
+      Serial.println(F("+/- - Adjust circle time"));
+      Serial.println(F("100-10000 - Set circle time"));
       Serial.println(F("H - This help"));
-      Serial.println(F("=========================="));
+      Serial.print(F("Circle time: "));
+      Serial.print(MANUAL_CIRCLE_TIME);
+      Serial.println(F("ms"));
+      Serial.println(F("========================"));
       break;
       
     default:
       lcd.clear();
-      lcd.print(F("Unknown Cmd:"));
-      lcd.print(command[0]);
+      lcd.print(F("Unknown Cmd"));
       delay(1000);
       updateDisplay();
       break;
@@ -1431,7 +1360,7 @@ void handleSerialCommand(const char* command) {
 void updateDisplay() {
   lcd.clear();
   
-  // 第一行
+  // 第一行：设置信息
   lcd.setCursor(0, 0);
   lcd.print(F("P"));
   lcd.print(playerCount);
@@ -1439,38 +1368,15 @@ void updateDisplay() {
   lcd.print(deckCount);
   lcd.print(F(" "));
   lcd.print(hasJokers ? F("J") : F("N"));
-  lcd.print(F(" "));
+  lcd.print(F(" M:"));
+  lcd.print(runtimeTurnaroundMode == 1 ? "C" : "T");
   
-  // 显示角度间隔
-  if (anglePerPlayer < 10) {
-    lcd.print(F("00"));
-    lcd.print((int)anglePerPlayer);
-  } else if (anglePerPlayer < 100) {
-    lcd.print(F("0"));
-    lcd.print((int)anglePerPlayer);
-  } else {
-    lcd.print((int)anglePerPlayer);
-  }
-  lcd.write(223);  // 度符号
+  // 显示圈时间
+  lcd.setCursor(10, 0);
+  if (MANUAL_CIRCLE_TIME < 1000) lcd.print(F("0"));
+  lcd.print(MANUAL_CIRCLE_TIME);
   
-  // 显示已发牌数
-  lcd.setCursor(11, 0);
-  lcd.print(F("D:"));
-  
-  if (dealtCards < 10) {
-    lcd.print(F("000"));
-    lcd.print(dealtCards);
-  } else if (dealtCards < 100) {
-    lcd.print(F("00"));
-    lcd.print(dealtCards);
-  } else if (dealtCards < 1000) {
-    lcd.print(F("0"));
-    lcd.print(dealtCards);
-  } else {
-    lcd.print(dealtCards);
-  }
-  
-  // 第二行
+  // 第二行：状态信息
   lcd.setCursor(0, 1);
   lcd.print(F("T:"));
   lcd.print(totalCards);
@@ -1483,28 +1389,25 @@ void updateDisplay() {
       case STATE_B_RUNNING: lcd.print(F("B")); break;
       case STATE_A_RUNNING: lcd.print(F("A")); break;
       case STATE_B_TIMEOUT: lcd.print(F("TO")); break;
+      case STATE_OBJECT_DETECTED: lcd.print(F("OD")); break; // 物体检测状态
       default: lcd.print(F("R"));
     }
   } else {
     lcd.print(F("S"));
   }
   
-  lcd.print(F(" "));
+  // 显示红外避障状态
+  lcd.setCursor(7, 1);
+  lcd.print(F(" IR:"));
   lcd.print(obstacleState == HIGH ? F("H") : F("L"));
   
   // 显示当前航向
-  lcd.setCursor(13, 0);
+  lcd.setCursor(12, 1);
   float displayAngle = getCurrentHeading();
   int intAngle = (int)displayAngle;
-  if (intAngle < 10) {
-    lcd.print(F("00"));
-    lcd.print(intAngle);
-  } else if (intAngle < 100) {
-    lcd.print(F("0"));
-    lcd.print(intAngle);
-  } else {
-    lcd.print(intAngle);
-  }
+  if (intAngle < 10) lcd.print(F("00"));
+  else if (intAngle < 100) lcd.print(F("0"));
+  lcd.print(intAngle);
 }
 
 void showStatusMessage(const char* message) {
@@ -1522,7 +1425,7 @@ void showStatusMessage(const char* message) {
 void setup() {
   delay(500);
   
-  // 初始化TB6612FNG引脚
+  // 初始化引脚
   pinMode(MOTOR_A_IN1, OUTPUT);
   pinMode(MOTOR_A_IN2, OUTPUT);
   pinMode(MOTOR_A_PWM, OUTPUT);
@@ -1532,34 +1435,28 @@ void setup() {
   pinMode(MOTOR_STBY, OUTPUT);
   pinMode(OBSTACLE_PIN, INPUT_PULLUP);
   
-  // 初始化时禁用电机驱动
   disableMotorDriver();
   
   lcd.begin(16, 2);
   lcd.clear();
-  lcd.print(F("Card Dealer v25.1"));
+  lcd.print(F("Card Dealer v28.0"));
   lcd.setCursor(0, 1);
-  lcd.print(F("All Devices Ready"));
+  lcd.print(F("Manual Calibration"));
   
   #if DEBUG
   Serial.begin(9600);
   delay(500);
-  Serial.println(F("System Startup v25.1"));
-  Serial.println(F("=========================="));
-  Serial.println(F("DEVICES CONNECTED:"));
-  Serial.println(F("1. TB6612FNG Motor Driver"));
-  Serial.println(F("2. QMC5883L Compass"));
-  Serial.println(F("3. LCD1602 Display"));
-  Serial.println(F("4. VS1838B IR Receiver"));
-  Serial.println(F("5. IR Obstacle Sensor"));
-  Serial.println(F("=========================="));
-  Serial.print(F("Motor A Speed: "));
-  Serial.println(MOTOR_A_SPEED);
-  Serial.print(F("Motor B Speed: "));
-  Serial.println(MOTOR_B_SPEED);
+  Serial.println(F("=== System Startup ==="));
+  Serial.println(F("Manual Calibration System"));
+  Serial.print(F("Initial mode: "));
+  Serial.println(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
+  Serial.print(F("Obstacle mode: Fixed to Leave Stop"));
+  Serial.print(F("Circle time: "));
+  Serial.print(MANUAL_CIRCLE_TIME);
+  Serial.println(F("ms"));
+  Serial.println(F("Use 'H' for help"));
   #endif
   
-  // 初始化红外接收
   #if ENABLE_INFRA
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
   #endif
@@ -1567,15 +1464,9 @@ void setup() {
   Wire.begin();
   delay(100);
   
-  int maxAttempts = 2;
+  // 初始化罗盘
   compassInitialized = false;
-  
-  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-    #if DEBUG
-    Serial.print(F("Compass initialization attempt "));
-    Serial.println(attempt);
-    #endif
-    
+  for (int attempt = 1; attempt <= 2; attempt++) {
     lcd.clear();
     lcd.print(F("Init Compass"));
     lcd.setCursor(0, 1);
@@ -1583,14 +1474,8 @@ void setup() {
     lcd.print(attempt);
     
     compassInitialized = initCompassUltimate();
-    
-    if (compassInitialized) {
-      break;
-    }
-    
-    if (attempt < maxAttempts) {
-      delay(1000);
-    }
+    if (compassInitialized) break;
+    delay(1000);
   }
   
   if (compassInitialized) {
@@ -1599,7 +1484,7 @@ void setup() {
     
     if (!calibrationDone) {
       lcd.clear();
-      lcd.print(F("Cal FAIL"));
+      lcd.print(F("Calibration"));
       lcd.setCursor(0, 1);
       lcd.print(F("Using Timeout"));
       delay(1000);
@@ -1613,51 +1498,34 @@ void setup() {
     
     initialHeading = 0;
     currentHeading = 0;
-    targetHeading = 0;
     virtualHeading = 0;
-    filteredHeading = 0;
+    targetHeading = 0;
     calibrationDone = false;
   }
   
-  uint8_t cardsPerDeck = hasJokers ? 54 : 52;
-  totalCards = deckCount * cardsPerDeck;
-  
-  if (remainCards > 0 && totalCards > remainCards) {
-    totalCards -= remainCards;
-  }
-  
+  totalCards = deckCount * (hasJokers ? 54 : 52);
   anglePerPlayer = 360.0 / playerCount;
   calculateMotorATimeout();
   
   obstacleState = digitalRead(OBSTACLE_PIN);
   lastObstacleState = obstacleState;
   
-  lastHeadingChangeTime = millis();
   compassResponding = true;
   noChangeCount = 0;
   
   serialBufferIndex = 0;
   serialBuffer[0] = '\0';
-  lastSerialCharTime = millis();
   
   updateDisplay();
   
   #if DEBUG
-  Serial.print(F("Angle per player: "));
-  Serial.println(anglePerPlayer, 1);
-  Serial.print(F("Motor A timeout per step: "));
-  Serial.print(motorATimeoutPerPlayer);
-  Serial.println(F(" ms"));
-  Serial.print(F("Player count: "));
+  Serial.print(F("Players: "));
   Serial.println(playerCount);
-  Serial.print(F("Total cards: "));
+  Serial.print(F("Cards: "));
   Serial.println(totalCards);
-  Serial.println(F("Setup complete"));
   Serial.print(F("Compass: "));
   Serial.println(compassInitialized ? "YES" : "NO");
-  Serial.print(F("Calibration: "));
-  Serial.println(calibrationDone ? "YES" : "NO");
-  Serial.println(F("=========================="));
+  Serial.println(F("========================"));
   #endif
 }
 
@@ -1675,40 +1543,23 @@ void loop() {
     handleMotorState();
   }
   
-  updateCompassHeading();
+  if (runtimeTurnaroundMode == 1) {
+    updateCompassHeading();
+  }
   
   #if DEBUG
-  if (millis() - lastDebugTime > 1000) {
-    float current = getCurrentHeading();
-    
-    Serial.print(F("State: "));
-    Serial.print(currentState);
-    Serial.print(F(" Cards: "));
+  // 减少状态打印频率到每3秒一次
+  if (millis() - lastDebugTime > 3000) {
+    Serial.print(F("Cards: "));
     Serial.print(dealtCards);
     Serial.print(F("/"));
     Serial.print(totalCards);
+    Serial.print(F(" Mode: "));
+    Serial.print(runtimeTurnaroundMode == 1 ? "Compass" : "Timeout");
     
     if (compassInitialized) {
       Serial.print(F(" Heading: "));
-      Serial.print(current, 1);
-      Serial.print(F(" ("));
-      Serial.print(compassResponding ? "Active" : "Stuck");
-      Serial.print(F(")"));
-    } else {
-      Serial.print(F(" Virtual: "));
-      Serial.print(current, 1);
-    }
-    
-    Serial.print(F(" Target: "));
-    Serial.print(targetHeading, 1);
-    float diff = getSimpleAngleDiff(current, targetHeading);
-    Serial.print(F(" Diff: "));
-    Serial.print(diff, 1);
-    
-    if (compassInitialized && compassResponding && calibrationDone) {
-      Serial.print(F(" [Compass Mode]"));
-    } else {
-      Serial.print(F(" [Timeout Mode]"));
+      Serial.print(getCurrentHeading(), 1);
     }
     
     Serial.println();
@@ -1719,104 +1570,3 @@ void loop() {
   
   delay(10);
 }
-/*
-一、引脚重新分配方案
-Arduino Pro Mini 引脚使用表
-设备	引脚	功能	备注
-LCD1602 (4位模式)			
-RS	12	寄存器选择	
-EN	11	使能	
-D4	5	数据线4	
-D5	4	数据线5	
-D6	3	数据线6	
-D7	2	数据线7	
-TB6612FNG			
-AIN1	6	电机A方向1	
-AIN2	7	电机A方向2	
-PWMA	9	电机A速度(PWM)	
-BIN1	A3	电机B方向1	模拟引脚作数字用
-BIN2	A2	电机B方向2	模拟引脚作数字用
-PWMB	10	电机B速度(PWM)	
-STBY	8	使能控制	
-传感器模块			
-QMC5883L	A4, A5	I2C	SDA=A4, SCL=A5
-红外接收(VS1838B)	A1	信号输入	模拟引脚作数字用
-红外避障模块	A0	信号输出	模拟引脚作数字用
-
-二完整代码，见上
-
-三、电路连接清单
-必须的连接：
-电源连接：
-
-TB6612FNG VM → 外部7-12V电源正极
-
-TB6612FNG GND → 外部电源负极 并且 连接到Arduino GND
-
-TB6612FNG VCC → Arduino 5V
-
-必须的电容：
-
-VM和GND之间：100µF电解电容 + 0.1µF瓷片电容
-
-VCC和GND之间：0.1µF瓷片电容
-
-电机连接：
-
-电机A → TB6612FNG的AO1和AO2
-
-电机B → TB6612FNG的BO1和BO2
-
-Arduino连接表：
-
-设备	引脚连接
-LCD1602 RS → Arduino 12	
-LCD1602 EN → Arduino 11	
-LCD1602 D4 → Arduino 5	
-LCD1602 D5 → Arduino 4	
-LCD1602 D6 → Arduino 3	
-LCD1602 D7 → Arduino 2	
-TB6612FNG AIN1 → Arduino 6	
-TB6612FNG AIN2 → Arduino 7	
-TB6612FNG PWMA → Arduino 9	
-TB6612FNG BIN1 → Arduino A3	
-TB6612FNG BIN2 → Arduino A2	
-TB6612FNG PWMB → Arduino 10	
-TB6612FNG STBY → Arduino 8	
-QMC5883L SDA → Arduino A4	
-QMC5883L SCL → Arduino A5	
-红外接收(VS1838B) OUT → Arduino A1	
-红外避障模块 OUT → Arduino A0	
-电源连接：
-
-LCD1602 VCC → Arduino 5V
-
-LCD1602 GND → Arduino GND
-
-红外接收器 VCC → Arduino 5V
-
-红外接收器 GND → Arduino GND
-
-红外避障模块 VCC → Arduino 5V
-
-红外避障模块 GND → Arduino GND
-
-QMC5883L VCC → Arduino 5V
-
-QMC5883L GND → Arduino GND
-
-四、主要特点
-无引脚冲突：所有设备引脚都经过仔细分配，避免冲突
-
-全功能支持：支持所有你提到的设备
-
-红外遥控：增加了红外遥控功能，可以通过遥控器控制发牌机
-
-TB6612FNG优化：充分利用了TB6612FNG的刹车功能，控制更精确
-
-调试友好：保留了完整的调试信息输出
-
-这个版本已经考虑了所有设备的引脚分配，应该可以直接使用。请按照上述连接表仔细连接所有设备。
-*/
-
-
