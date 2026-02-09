@@ -526,7 +526,6 @@ bool rotateToAngle() {
 // ==================== 障碍事件处理 ====================
 void handleObstacleEvent() {
   lastObstacleTime = millis();
-  
   stopAllMotors();
   dealtCards++;
   if (dealtCards > totalCards) dealtCards = totalCards;
@@ -964,7 +963,7 @@ void processInfraredInput() {
           updateDisplay();
         }
         break;
-        case IR_NTM:  // 自定义键码
+      case IR_BTM:  // 自定义键码
         if (!isRunning) {
           motorBTimeout -= 1000;  // 减少1秒
           if (motorBTimeout > 15000) motorBTimeout = 8000;  // 最大30秒，最小3秒
