@@ -91,7 +91,7 @@ const float MAGNETIC_DECLINATION = 5.0;
 float currentHeading = 0.0;
 float targetHeading = 0.0;
 float anglePerPlayer = 90.0;
-float angleTolerance = 2.0;
+float angleTolerance = 7.0;
 float initialHeading = 0.0;
 
 // ==================== 电机控制参数 ====================
@@ -261,9 +261,12 @@ float getCurrentHeading() {
 }
 
 // ==================== 罗盘更新函数 ====================
+/*
 void updateCompassHeading() {
   if (!compassInitialized) return;
   if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
+  // 若电机A正在旋转，降低罗盘可信度（仅用于显示，不参与控制）
+  bool motorRunning = (currentState == STATE_A_RUNNING);  
   float newHeading;
   if (readCompassHeading(newHeading)) {
     float change = fabs(newHeading - lastValidHeading);
@@ -290,6 +293,89 @@ void updateCompassHeading() {
     }
   }
   lastCompassUpdate = millis();
+}
+*/
+/**
+ * @brief 罗盘航向更新函数（增强版）
+ * 
+ * 功能：
+ * - 以 COMPASS_UPDATE_INTERVAL 为周期读取QMC5883L
+ * - 5点滑动平均滤波，抑制瞬时噪声
+ * - 电机旋转时：滤波航向不参与控制（仅显示），且不将罗盘值同步至虚拟航向
+ * - 电机静止时：罗盘值同步至虚拟航向，确保起点准确
+ * - 罗盘卡死检测：若航向连续15次无变化（>0.5°），标记 compassResponding = false
+ */
+void updateCompassHeading() {
+    // 1. 罗盘未初始化 → 直接返回
+    if (!compassInitialized) return;
+
+    // 2. 更新频率控制
+    if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
+
+    // 3. 读取原始航向
+    float rawHeading;
+    if (!readCompassHeading(rawHeading)) {
+        // 读取失败，跳过本次更新
+        lastCompassUpdate = millis();
+        return;
+    }
+
+    // ---------- 罗盘响应性检测 ----------
+    float change = fabs(rawHeading - lastValidHeading);
+    if (change > 0.5) {
+        compassResponding = true;
+        noChangeCount = 0;
+        lastHeadingChangeTime = millis();
+    } else {
+        noChangeCount++;
+        if (noChangeCount > MAX_NO_CHANGE) compassResponding = false;
+    }
+    lastValidHeading = rawHeading;
+
+    // ---------- 滑动平均滤波（5点）----------
+    const int FILTER_SIZE = 5;          // 原为3点，扩大至5点，滤波更平滑
+    static float headingBuffer[FILTER_SIZE];
+    static int bufferIndex = 0;
+    static bool bufferFilled = false;
+
+    headingBuffer[bufferIndex] = rawHeading;
+    bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
+    if (bufferIndex == 0) bufferFilled = true;
+
+    float filtered = rawHeading;       // 默认值（缓冲区未满时）
+    if (bufferFilled) {
+        float sum = 0;
+        for (int i = 0; i < FILTER_SIZE; i++) {
+            sum += headingBuffer[i];
+        }
+        filtered = normalizeAngle(sum / FILTER_SIZE);
+    }
+    filteredHeading = filtered;        // 更新全局滤波值（主要用于显示）
+
+    // ---------- 电机状态判断 ----------
+    bool isMotorARunning = (currentState == STATE_A_RUNNING);
+
+    // ---------- 虚拟航向同步策略 ----------
+    if (!isMotorARunning) {
+        // 电机静止时 → 完全信任罗盘，将滤波航向同步至虚拟航向
+        virtualHeading = filteredHeading;
+    } else {
+        // 电机旋转时 → 虚拟航向保持开环推算，不同步罗盘值
+        // （罗盘受振动干扰极大，此时读数不可信）
+        // 但为了显示稳定，仍然保留滤波航向的计算，仅用于LCD显示
+    }
+
+    // 可选：即使电机旋转，如果罗盘已长时间不响应，则强制同步一次
+    if (!compassResponding && isMotorARunning) {
+        // 罗盘彻底死掉，强制用最后一次有效值修正虚拟航向（防止无限漂移）
+        virtualHeading = filteredHeading;   // 最后一次有效滤波值
+    }
+
+    // 记录当前航向（供调试显示用）
+    currentHeading = filteredHeading;
+
+    // 更新时间戳
+    lastCompassUpdate = millis();
 }
 
 // ==================== QMC5883L初始化 ====================
@@ -414,7 +500,7 @@ bool rotateToAngle() {
   if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) return false;
   lastMotorUpdate = millis();
   unsigned long elapsed = millis() - aMotorTimeoutStart;
-
+  /*用真是航向修正，用下面一段代码替换
   if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
     // ---------- 罗盘模式：闭环角度控制 + 长超时保护 ----------
     float current = getCurrentHeading();   // 旋转时返回虚拟航向，响应迅速
@@ -427,6 +513,32 @@ bool rotateToAngle() {
     if (elapsed >= MANUAL_CIRCLE_TIME * 2) {
       stopAllMotors();
       return true;
+    }
+    controlMotorA(true);
+    return false;
+  }
+  */
+  if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
+    // 1. 每200ms尝试用真实航向修正虚拟航向
+    static unsigned long lastCorrection = 0;
+    if (millis() - lastCorrection > 200) {
+        lastCorrection = millis();
+        float realHeading;
+        if (readCompassHeading(realHeading)) {
+            // 加权平均：虚拟航向占70%，真实航向占30%
+            virtualHeading = normalizeAngle(virtualHeading * 0.7 + realHeading * 0.3);
+        }
+    }
+
+    float current = virtualHeading;   // 仍以虚拟航向为主，但已被反馈修正
+    float angleDiff = getSimpleAngleDiff(current, targetHeading);
+    if (fabs(angleDiff) <= angleTolerance) {
+        stopAllMotors();
+        return true;
+    }
+    if (elapsed >= MANUAL_CIRCLE_TIME * 2) {
+        stopAllMotors();
+        return true;
     }
     controlMotorA(true);
     return false;
@@ -446,6 +558,7 @@ bool rotateToAngle() {
 void handleObstacleEvent() {
   lastObstacleTime = millis();
   stopAllMotors();
+  delay(100);
   dealtCards++;
   if (dealtCards > totalCards) dealtCards = totalCards;
   #if DEBUG
@@ -462,6 +575,23 @@ void handleObstacleEvent() {
   rotationStartHeading = getCurrentHeading();
   rotationStartTime = millis();
   virtualHeading = rotationStartHeading;
+
+  /* 新增强制罗盘更新*/
+    // === 新增：罗盘稳定读取 ===
+  float stableHeading = 0.0;
+  int valid = 0;
+  for (int i = 0; i < 5; i++) {
+      updateCompassHeading();   // 强制更新罗盘
+      float h = getCurrentHeading();
+      stableHeading += h;
+      valid++;
+      delay(20);
+  }
+  float realHeading = normalizeAngle(stableHeading / valid);
+  // =========================
+  rotationStartHeading = realHeading;   // 以真实航向为下一轮起点
+  rotationStartTime = millis();
+  virtualHeading = realHeading;
 
   changeState(STATE_A_RUNNING);
   aMotorTimeoutStart = millis();
@@ -580,6 +710,10 @@ void handleMotorState() {
     case STATE_A_RUNNING:
       if (rotateToAngle()) {
         stopAllMotors();
+        /*每发一轮牌将当前航向重新设定为initialHeding*/
+        if (dealtCards % playerCount == 0) {   // 完成一整轮
+            initialHeading = getCurrentHeading();   // 重新基准
+        }
         if (dealtCards >= totalCards && totalCards > 0) {
           stopDealing();
           showStatusMessage("All Done!");
