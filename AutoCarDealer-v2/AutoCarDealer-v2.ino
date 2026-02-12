@@ -29,7 +29,7 @@ LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
 QMC5883LCompass compass;
 
 #if ENABLE_INFRA
-IRrecv irrecv(IR_RECEIVE_PIN);
+//IRrecv irrecv(IR_RECEIVE_PIN);
 decode_results results;
 #endif
 
@@ -88,6 +88,11 @@ const int MAX_NO_CHANGE = 15;
 
 float virtualHeading = 0.0;
 const float MAGNETIC_DECLINATION = 5.0;
+float currentHeading = 0.0;
+float targetHeading = 0.0;
+float anglePerPlayer = 90.0;
+float angleTolerance = 2.0;
+float initialHeading = 0.0;
 
 // ==================== 电机控制参数 ====================
 unsigned long lastMotorUpdate = 0;
@@ -1165,7 +1170,7 @@ void setup() {
   Serial.println(F("Use 'H' help"));
   #endif
   #if ENABLE_INFRA
-  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+  IrReceiver.begin(IR_RECEIVE_PIN);
   #endif
   Wire.begin();
   delay(100);
