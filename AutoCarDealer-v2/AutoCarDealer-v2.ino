@@ -165,6 +165,7 @@ float updateVirtualHeadingDuringRotation();
 float getCurrentHeading();
 void updateCompassHeading();
 bool initCompassUltimate();
+void i2c_release_bus();          // 新增：释放I2C总线
 void calibrateCompass();
 void autoCalibrateCircleTime();
 bool rotateToAngle();
@@ -363,8 +364,31 @@ void updateCompassHeading() {
     lastCompassUpdate = millis();
 }
 
-// ==================== QMC5883L 终极初始化 ====================
+// ==================== 释放I2C总线（产生STOP信号）====================
+void i2c_release_bus() {
+    // 使用默认的SDA/SCL引脚（Arduino Uno: A4=SDA, A5=SCL）
+    pinMode(SDA, OUTPUT);
+    pinMode(SCL, OUTPUT);
+    digitalWrite(SDA, HIGH);
+    digitalWrite(SCL, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(SCL, LOW);
+    delayMicroseconds(10);
+    digitalWrite(SCL, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(SDA, LOW);
+    delayMicroseconds(10);
+    digitalWrite(SDA, HIGH);
+    delayMicroseconds(10);
+    pinMode(SDA, INPUT_PULLUP);
+    pinMode(SCL, INPUT_PULLUP);
+}
+
+// ==================== QMC5883L 终极初始化（带超时保护）====================
 bool initCompassUltimate() {
+    unsigned long startTime = millis();
+    const unsigned long timeout = 2000;  // 总超时2秒
+
 #if DEBUG
     Serial.println(F("Init Compass..."));
 #endif
@@ -375,15 +399,28 @@ bool initCompassUltimate() {
     delay(100);
     Wire.end();
     delay(50);
+
+    // 释放总线，避免卡死
+    i2c_release_bus();
+
     Wire.begin();
     Wire.setClock(100000);
     delay(200);
 
     bool i2cConnected = false;
     for (int attempt = 1; attempt <= 3; attempt++) {
+        if (millis() - startTime > timeout) {
+#if DEBUG
+            Serial.println(F("I2C timeout"));
+#endif
+            return false;
+        }
         Wire.beginTransmission(0x0D);
         byte error = Wire.endTransmission();
-        if (error == 0) { i2cConnected = true; break; }
+        if (error == 0) {
+            i2cConnected = true;
+            break;
+        }
         delay(100);
     }
     if (!i2cConnected) {
@@ -395,11 +432,18 @@ bool initCompassUltimate() {
 
     compass.init();
     delay(100);
+
     bool dataValid = false;
     for (int i = 0; i < 5; i++) {
+        if (millis() - startTime > timeout) {
+            return false;
+        }
         compass.read();
         int x = compass.getX(), y = compass.getY(), z = compass.getZ();
-        if (x != 0 || y != 0 || z != 0) { dataValid = true; break; }
+        if (x != 0 || y != 0 || z != 0) {
+            dataValid = true;
+            break;
+        }
         delay(50);
     }
 
@@ -410,6 +454,9 @@ bool initCompassUltimate() {
         float headingSum = 0;
         int validHeadings = 0;
         for (int i = 0; i < 5; i++) {
+            if (millis() - startTime > timeout) {
+                return false;
+            }
             compass.read();
             int rawHeading = compass.getAzimuth();
             if (rawHeading >= 0 && rawHeading <= 360) {
@@ -539,7 +586,7 @@ void autoCalibrateCircleTime() {
     updateDisplay();
 }
 
-// ==================== 旋转控制函数（双模式隔离）====================
+// ==================== 旋转控制函数（双模式隔离，增加实际航向反馈）====================
 bool rotateToAngle() {
     if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) return false;
     lastMotorUpdate = millis();
@@ -547,27 +594,41 @@ bool rotateToAngle() {
     // ---------- 罗盘模式：闭环角度控制（逆时针距离）----------
     if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
         unsigned long elapsed = millis() - aMotorTimeoutStart;
-        float current = updateVirtualHeadingDuringRotation();
-        float ccwDist = getCCWDistance(current, targetHeading);
+        float currentVirtual = updateVirtualHeadingDuringRotation();
+        float currentActual = filteredHeading; // 使用滤波后的实际航向
+        float ccwDistVirtual = getCCWDistance(currentVirtual, targetHeading);
+        float ccwDistActual = getCCWDistance(currentActual, targetHeading);
 
 #if DEBUG
         static unsigned long lastDebugPrint = 0;
         if (millis() - lastDebugPrint > 200) {
-            Serial.print(F("C:")); Serial.print(current, 1);
+            Serial.print(F("Cv:")); Serial.print(currentVirtual, 1);
+            Serial.print(F(" Ca:")); Serial.print(currentActual, 1);
             Serial.print(F(" T:")); Serial.print(targetHeading, 1);
-            Serial.print(F(" CCW:")); Serial.println(ccwDist, 1);
+            Serial.print(F(" CCWv:")); Serial.print(ccwDistVirtual, 1);
+            Serial.print(F(" CCWa:")); Serial.println(ccwDistActual, 1);
             lastDebugPrint = millis();
         }
 #endif
 
-        if (ccwDist <= angleTolerance || (360.0 - ccwDist) <= angleTolerance) {
+        // 如果实际航向已到达目标，立即停止
+        if (ccwDistActual <= angleTolerance || (360.0 - ccwDistActual) <= angleTolerance) {
             stopAllMotors();
             return true;
         }
+
+        // 如果虚拟航向到达目标，也停止
+        if (ccwDistVirtual <= angleTolerance || (360.0 - ccwDistVirtual) <= angleTolerance) {
+            stopAllMotors();
+            return true;
+        }
+
+        // 超时保护
         if (elapsed >= MANUAL_CIRCLE_TIME * 2) {
             stopAllMotors();
             return true;
         }
+
         controlMotorA(true);
         return false;
     }
