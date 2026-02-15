@@ -1,7 +1,7 @@
 // ==================== 系统配置宏 ====================
 #define TURNAROUND_MODE 0          // 默认超时模式 (0=超时, 1=罗盘)
-#define ENABLE_INFRA 1            // 启用红外遥控
-#define ENABLE_KEYBOARD 0         // 启用串口键盘指令
+#define ENABLE_INFRA 0            // 启用红外遥控
+#define ENABLE_KEYBOARD 1         // 启用串口键盘指令
 #define DEBUG 1                  // 调试信息输出
 #define IR_DEBUG 0               // 红外详细调试（关闭减少串口干扰）
 
@@ -93,16 +93,28 @@ bool compassResponding = true;
 int noChangeCount = 0;
 const int MAX_NO_CHANGE = 15;
 
-// 罗盘滤波缓冲区（7点）
+// 新增：罗盘健康状态
+bool compassHealthy = true;
+unsigned long lastSuccessfulCompassTime = 0;
+const unsigned long COMPASS_HEALTH_TIMEOUT = 500; // 500ms无成功读数则认为不健康
+
+// 罗盘滤波缓冲区（7点滑动平均）
 const int FILTER_SIZE = 7;
 float headingBuffer[FILTER_SIZE];
 int bufferIndex = 0;
 bool bufferFilled = false;
 
+// 中值滤波缓冲区（5点，用于剔除异常值）
+const int MEDIAN_SIZE = 5;
+float medianBuffer[MEDIAN_SIZE];
+int medianIndex = 0;
+bool medianFilled = false;
+
 // ---- 角度控制参数（罗盘模式）----
 float targetHeading = 0.0;
 float anglePerPlayer = 90.0;
-float angleTolerance = 6.0;
+float angleTolerance = 6.0;          // 实际航向容忍度
+float virtualTolerance = 8.0;         // 虚拟航向辅助容忍度（稍大）
 
 // ---- 旋转状态跟踪 ----
 float rotationStartHeading = 0.0;
@@ -114,6 +126,16 @@ bool runtimeTurnaroundMode = TURNAROUND_MODE;
 
 // ---- 超时模式动态补偿用基准（仅超时模式）----
 float timeoutInitialHeading = 0.0;   // 超时模式下的虚拟基准
+
+// ---- 堵转检测 ----
+float lastActualForStall = 0.0;
+int stallCounter = 0;
+const float STALL_THRESHOLD = 0.5;    // 变化小于0.5°认为堵转
+const int STALL_COUNT_LIMIT = 8;      // 连续8次采样不变（约160ms）
+bool stallDetected = false;
+
+// ---- 动态超时 ----
+unsigned long dynamicTimeout = 0;     // 当前旋转的动态超时时间
 
 // ---- 串口缓冲区 ----
 const int SERIAL_BUFFER_SIZE = 32;
@@ -163,12 +185,12 @@ void calculateMotorATimeout();
 bool readCompassHeading(float &heading);
 float updateVirtualHeadingDuringRotation();
 float getCurrentHeading();
-void updateCompassHeading();
+void updateCompassHeading();          // 增强版：中值+滑动平均
 bool initCompassUltimate();
-void i2c_release_bus();          // 新增：释放I2C总线
+void i2c_release_bus();
 void calibrateCompass();
 void autoCalibrateCircleTime();
-bool rotateToAngle();
+bool rotateToAngle();                 // 改进版：带健康降级
 void handleObstacleEvent();
 void changeState(SystemState newState);
 void startDealing();
@@ -291,6 +313,88 @@ bool readCompassHeading(float &heading) {
     return false;
 }
 
+// ==================== 增强型罗盘更新（中值+滑动平均）====================
+void updateCompassHeading() {
+    if (!compassInitialized) return;
+    if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
+
+    float rawHeading;
+    bool success = readCompassHeading(rawHeading);
+    if (!success) {
+        // 读取失败，标记不健康
+        if (millis() - lastSuccessfulCompassTime > COMPASS_HEALTH_TIMEOUT) {
+            compassHealthy = false;
+        }
+        lastCompassUpdate = millis();
+        return;
+    }
+
+    // 读取成功，更新健康状态
+    lastSuccessfulCompassTime = millis();
+    compassHealthy = true;
+
+    // 响应性检测
+    float change = fabs(rawHeading - lastValidHeading);
+    if (change > 0.5) {
+        compassResponding = true;
+        noChangeCount = 0;
+        lastHeadingChangeTime = millis();
+    } else {
+        noChangeCount++;
+        if (noChangeCount > MAX_NO_CHANGE) compassResponding = false;
+    }
+    lastValidHeading = rawHeading;
+
+    // 1. 中值滤波（5点）剔除异常跳变
+    medianBuffer[medianIndex] = rawHeading;
+    medianIndex = (medianIndex + 1) % MEDIAN_SIZE;
+    if (medianIndex == 0) medianFilled = true;
+
+    float medianHeading = rawHeading;
+    if (medianFilled) {
+        // 复制缓冲区并排序
+        float temp[MEDIAN_SIZE];
+        for (int i = 0; i < MEDIAN_SIZE; i++) temp[i] = medianBuffer[i];
+        // 简单冒泡排序
+        for (int i = 0; i < MEDIAN_SIZE-1; i++) {
+            for (int j = i+1; j < MEDIAN_SIZE; j++) {
+                if (temp[i] > temp[j]) {
+                    float t = temp[i];
+                    temp[i] = temp[j];
+                    temp[j] = t;
+                }
+            }
+        }
+        medianHeading = temp[MEDIAN_SIZE/2]; // 中值
+    }
+
+    // 2. 滑动平均（7点）作用于中值后的数据
+    headingBuffer[bufferIndex] = medianHeading;
+    bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
+    if (bufferIndex == 0) bufferFilled = true;
+
+    if (bufferFilled) {
+        float sum = 0;
+        for (int i = 0; i < FILTER_SIZE; i++) sum += headingBuffer[i];
+        filteredHeading = normalizeAngle(sum / FILTER_SIZE);
+    } else {
+        filteredHeading = medianHeading;
+    }
+
+    // 罗盘模式且电机静止时，同步虚拟航向
+    bool isMotorARunning = (currentState == STATE_A_RUNNING);
+    if (runtimeTurnaroundMode == 1 && !isMotorARunning) {
+        virtualHeading = filteredHeading;
+    }
+    // 罗盘不响应且静止时强制同步
+    if (!compassResponding && !isMotorARunning) {
+        virtualHeading = filteredHeading;
+    }
+
+    currentHeading = filteredHeading;
+    lastCompassUpdate = millis();
+}
+
 // ==================== 虚拟航向更新 ====================
 float updateVirtualHeadingDuringRotation() {
     if (!rotationInProgress) return virtualHeading;
@@ -314,59 +418,8 @@ float getCurrentHeading() {
     }
 }
 
-// ==================== 罗盘更新（7点滑动平均+静止同步）====================
-void updateCompassHeading() {
-    if (!compassInitialized) return;
-    if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
-
-    float rawHeading;
-    if (!readCompassHeading(rawHeading)) {
-        lastCompassUpdate = millis();
-        return;
-    }
-
-    // 响应性检测
-    float change = fabs(rawHeading - lastValidHeading);
-    if (change > 0.5) {
-        compassResponding = true;
-        noChangeCount = 0;
-        lastHeadingChangeTime = millis();
-    } else {
-        noChangeCount++;
-        if (noChangeCount > MAX_NO_CHANGE) compassResponding = false;
-    }
-    lastValidHeading = rawHeading;
-
-    // 7点滑动平均
-    headingBuffer[bufferIndex] = rawHeading;
-    bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
-    if (bufferIndex == 0) bufferFilled = true;
-
-    if (bufferFilled) {
-        float sum = 0;
-        for (int i = 0; i < FILTER_SIZE; i++) sum += headingBuffer[i];
-        filteredHeading = normalizeAngle(sum / FILTER_SIZE);
-    } else {
-        filteredHeading = rawHeading;
-    }
-
-    // 罗盘模式且电机静止时，同步虚拟航向
-    bool isMotorARunning = (currentState == STATE_A_RUNNING);
-    if (runtimeTurnaroundMode == 1 && !isMotorARunning) {
-        virtualHeading = filteredHeading;
-    }
-    // 罗盘不响应且静止时强制同步
-    if (!compassResponding && !isMotorARunning) {
-        virtualHeading = filteredHeading;
-    }
-
-    currentHeading = filteredHeading;
-    lastCompassUpdate = millis();
-}
-
-// ==================== 释放I2C总线（产生STOP信号）====================
+// ==================== 释放I2C总线 ====================
 void i2c_release_bus() {
-    // 使用默认的SDA/SCL引脚（Arduino Uno: A4=SDA, A5=SCL）
     pinMode(SDA, OUTPUT);
     pinMode(SCL, OUTPUT);
     digitalWrite(SDA, HIGH);
@@ -384,10 +437,10 @@ void i2c_release_bus() {
     pinMode(SCL, INPUT_PULLUP);
 }
 
-// ==================== QMC5883L 终极初始化（带超时保护）====================
+// ==================== QMC5883L 初始化（带超时保护）====================
 bool initCompassUltimate() {
     unsigned long startTime = millis();
-    const unsigned long timeout = 2000;  // 总超时2秒
+    const unsigned long timeout = 2000;
 
 #if DEBUG
     Serial.println(F("Init Compass..."));
@@ -400,7 +453,6 @@ bool initCompassUltimate() {
     Wire.end();
     delay(50);
 
-    // 释放总线，避免卡死
     i2c_release_bus();
 
     Wire.begin();
@@ -473,10 +525,14 @@ bool initCompassUltimate() {
             virtualHeading = initialReading;
             lastValidHeading = initialReading;
             for (int i = 0; i < FILTER_SIZE; i++) headingBuffer[i] = initialReading;
+            for (int i = 0; i < MEDIAN_SIZE; i++) medianBuffer[i] = initialReading;
             bufferFilled = true;
+            medianFilled = true;
         }
         compassResponding = true;
         noChangeCount = 0;
+        lastSuccessfulCompassTime = millis(); // 初始化成功时间
+        compassHealthy = true;
 #if DEBUG
         Serial.print(F("Compass OK: "));
         Serial.println(filteredHeading, 1);
@@ -523,7 +579,9 @@ void calibrateCompass() {
     lastValidHeading = avgHeading;
     calibrationDone = true;
     for (int i = 0; i < FILTER_SIZE; i++) headingBuffer[i] = avgHeading;
+    for (int i = 0; i < MEDIAN_SIZE; i++) medianBuffer[i] = avgHeading;
     bufferFilled = true;
+    medianFilled = true;
 
 #if DEBUG
     Serial.print(F("Cal done: "));
@@ -586,45 +644,59 @@ void autoCalibrateCircleTime() {
     updateDisplay();
 }
 
-// ==================== 旋转控制函数（双模式隔离，增加实际航向反馈）====================
+// ==================== 改进的旋转控制函数（带健康降级）====================
 bool rotateToAngle() {
     if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) return false;
     lastMotorUpdate = millis();
 
-    // ---------- 罗盘模式：闭环角度控制（逆时针距离）----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
-        unsigned long elapsed = millis() - aMotorTimeoutStart;
+    unsigned long elapsed = millis() - aMotorTimeoutStart;
+
+    // ---------- 罗盘模式：如果罗盘健康且校准完成，使用闭环控制；否则降级为超时模式 ----------
+    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
+        float currentActual = filteredHeading;
         float currentVirtual = updateVirtualHeadingDuringRotation();
-        float currentActual = filteredHeading; // 使用滤波后的实际航向
-        float ccwDistVirtual = getCCWDistance(currentVirtual, targetHeading);
-        float ccwDistActual = getCCWDistance(currentActual, targetHeading);
+        float diffActual = getSimpleAngleDiff(currentActual, targetHeading);
+        float diffVirtual = getSimpleAngleDiff(currentVirtual, targetHeading);
 
 #if DEBUG
         static unsigned long lastDebugPrint = 0;
         if (millis() - lastDebugPrint > 200) {
-            Serial.print(F("Cv:")); Serial.print(currentVirtual, 1);
-            Serial.print(F(" Ca:")); Serial.print(currentActual, 1);
+            Serial.print(F("Ca:")); Serial.print(currentActual, 1);
+            Serial.print(F(" Cv:")); Serial.print(currentVirtual, 1);
             Serial.print(F(" T:")); Serial.print(targetHeading, 1);
-            Serial.print(F(" CCWv:")); Serial.print(ccwDistVirtual, 1);
-            Serial.print(F(" CCWa:")); Serial.println(ccwDistActual, 1);
+            Serial.print(F(" diffA:")); Serial.print(diffActual, 1);
+            Serial.print(F(" diffV:")); Serial.println(diffVirtual, 1);
             lastDebugPrint = millis();
         }
 #endif
 
-        // 如果实际航向已到达目标，立即停止
-        if (ccwDistActual <= angleTolerance || (360.0 - ccwDistActual) <= angleTolerance) {
+        // 堵转检测：实际航向长时间不变
+        if (fabs(currentActual - lastActualForStall) < STALL_THRESHOLD) {
+            stallCounter++;
+        } else {
+            stallCounter = 0;
+            lastActualForStall = currentActual;
+        }
+        if (stallCounter >= STALL_COUNT_LIMIT) {
+            stopAllMotors();
+            stallDetected = true;
+            return true;
+        }
+
+        // 主要停止条件：实际航向到达目标
+        if (fabs(diffActual) <= angleTolerance) {
             stopAllMotors();
             return true;
         }
 
-        // 如果虚拟航向到达目标，也停止
-        if (ccwDistVirtual <= angleTolerance || (360.0 - ccwDistVirtual) <= angleTolerance) {
+        // 辅助停止条件：虚拟航向已过目标且实际航向接近
+        if (fabs(diffVirtual) <= virtualTolerance && fabs(diffActual) <= angleTolerance * 2) {
             stopAllMotors();
             return true;
         }
 
-        // 超时保护
-        if (elapsed >= MANUAL_CIRCLE_TIME * 2) {
+        // 动态超时：如果 elapsed 超过理论时间的1.5倍，强制停止
+        if (elapsed >= (unsigned long)(motorATimeoutPerPlayer * 1.5)) {
             stopAllMotors();
             return true;
         }
@@ -632,9 +704,16 @@ bool rotateToAngle() {
         controlMotorA(true);
         return false;
     }
-    // ---------- 超时模式：开环定时 ----------
+    // ---------- 降级为超时模式：开环定时（包括罗盘模式但罗盘不健康的情况）----------
     else {
-        unsigned long elapsed = millis() - aMotorTimeoutStart;
+        // 如果当前是罗盘模式但罗盘不健康，可以打印一条警告（可选）
+        if (runtimeTurnaroundMode == 1 && (!compassHealthy || !calibrationDone)) {
+            static unsigned long lastWarn = 0;
+            if (millis() - lastWarn > 5000) {
+                Serial.println(F("Compass unhealthy, using timeout mode temporarily"));
+                lastWarn = millis();
+            }
+        }
         if (elapsed >= motorATimeoutPerPlayer) {
             stopAllMotors();
             return true;
@@ -644,7 +723,7 @@ bool rotateToAngle() {
     }
 }
 
-// ==================== 障碍事件处理（核心修改）====================
+// ==================== 障碍事件处理 ====================
 void handleObstacleEvent() {
     lastObstacleTime = millis();
     stopAllMotors();
@@ -656,8 +735,15 @@ void handleObstacleEvent() {
     Serial.println(dealtCards);
 #endif
 
-    // ---------- 罗盘模式：目标 = 当前航向 - 90°（固定逆时针90°）----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized) {
+    // 重置堵转检测
+    stallCounter = 0;
+    if (compassInitialized && calibrationDone) {
+        lastActualForStall = filteredHeading;
+    }
+    stallDetected = false;
+
+    // ---------- 罗盘模式：如果罗盘健康且校准完成，使用实际航向设定目标 ----------
+    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
         // 读取当前真实航向（多次平均）
         float sum = 0;
         int count = 0;
@@ -670,11 +756,9 @@ void handleObstacleEvent() {
         float realHeading = normalizeAngle(sum / count);
         rotationStartHeading = realHeading;
         virtualHeading = realHeading;
-
-        // 目标 = 当前航向 - 90°
         targetHeading = normalizeAngle(realHeading - anglePerPlayer);
     }
-    // ---------- 超时模式：沿用原有逻辑（基于虚拟基准）----------
+    // ---------- 超时模式或罗盘不健康：基于虚拟基准（固定0）----------
     else {
         uint8_t currentPlayerIndex = dealtCards % playerCount;
         float targetAngle = timeoutInitialHeading - (currentPlayerIndex * anglePerPlayer);
@@ -738,14 +822,14 @@ void startDealing() {
     stopAllMotors();
     enableMotorDriver();
 
-    // ---------- 罗盘模式：无需基准，只需同步当前航向 ----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone) {
+    // ---------- 罗盘模式：如果罗盘健康且校准完成，同步当前航向 ----------
+    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
         updateCompassHeading();
         virtualHeading = filteredHeading;
         rotationStartHeading = filteredHeading;
         targetHeading = filteredHeading;   // 第一张牌无需旋转（直接推牌）
     }
-    // ---------- 超时模式：设置虚拟基准为0 ----------
+    // ---------- 超时模式或罗盘不健康：设置虚拟基准为0 ----------
     else {
         timeoutInitialHeading = 0;
         virtualHeading = 0;
@@ -805,16 +889,24 @@ void handleMotorState() {
             if (rotateToAngle()) {
                 stopAllMotors();
 
+                // 如果检测到堵转，停止发牌并显示错误
+                if (stallDetected) {
+                    showStatusMessage("Stall! Stop");
+                    delay(1000);
+                    stopDealing();
+                    break;
+                }
+
                 // ---------- 超时模式动态补偿（利用罗盘修正）---------
-                if (runtimeTurnaroundMode == 0 && compassInitialized && calibrationDone) {
-                    float realHeading = getCurrentHeading();
+                if (runtimeTurnaroundMode == 0 && compassInitialized && calibrationDone && compassHealthy) {
+                    float realHeading = filteredHeading;
                     float expectedHeading = normalizeAngle(timeoutInitialHeading - (dealtCards % playerCount) * anglePerPlayer);
                     float angleError = getSimpleAngleDiff(realHeading, expectedHeading);
                     const float MS_PER_DEG = (float)MANUAL_CIRCLE_TIME / 360.0;
-                    long correction = (long)(angleError * MS_PER_DEG);
+                    long correction = (long)(angleError * MS_PER_DEG * 0.5); // 学习因子0.5
                     correction = constrain(correction, -50, 50);
                     int newTimeout = (int)motorATimeoutPerPlayer - correction;
-                    motorATimeoutPerPlayer = (unsigned long)constrain(newTimeout, 100, 1000);
+                    motorATimeoutPerPlayer = (unsigned long)constrain(newTimeout, 200, 1200);
 #if DEBUG
                     Serial.print(F("Angle err: ")); Serial.print(angleError, 1);
                     Serial.print(F("°, Corr: ")); Serial.print(correction);
@@ -1052,9 +1144,9 @@ void processInfraredInput() {
                 break;
             case IR_VERSION:
                 lcd.clear();
-                lcd.print(F("Dealer v32.0"));
+                lcd.print(F("Dealer v34.0"));
                 lcd.setCursor(0, 1);
-                lcd.print(F("FixCCW"));
+                lcd.print(F("HybridSafe"));
                 delay(800);
                 updateDisplay();
                 break;
@@ -1138,9 +1230,9 @@ void handleSerialCommand(const char* command) {
     switch (command[0]) {
         case 'v': case 'V':
             lcd.clear();
-            lcd.print(F("Dealer v32.0"));
+            lcd.print(F("Dealer v34.0"));
             lcd.setCursor(0, 1);
-            lcd.print(F("FixCCW"));
+            lcd.print(F("HybridSafe"));
             delay(800);
             updateDisplay();
             break;
@@ -1378,15 +1470,15 @@ void setup() {
 
     lcd.begin(16, 2);
     lcd.clear();
-    lcd.print(F("Dealer v32.0"));
+    lcd.print(F("Dealer v34.0"));
     lcd.setCursor(0, 1);
-    lcd.print(F("FixCCW"));
+    lcd.print(F("HybridSafe"));
 
 #if DEBUG
     Serial.begin(9600);
     delay(500);
     Serial.println(F("=== System Startup ==="));
-    Serial.println(F("Manual Calibration"));
+    Serial.println(F("Hybrid Safe Mode"));
     Serial.print(F("Init mode: "));
     Serial.println(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
     Serial.print(F("Circle: "));
