@@ -1,14 +1,11 @@
 // ==================== 系统配置宏 ====================
-#define TURNAROUND_MODE 0          // 默认超时模式 (0=超时, 1=罗盘)
-#define ENABLE_INFRA 0            // 启用红外遥控
-#define ENABLE_KEYBOARD 1         // 启用串口键盘指令
-#define DEBUG 1                  // 调试信息输出
-#define IR_DEBUG 0               // 红外详细调试（关闭减少串口干扰）
+#define ENABLE_INFRA 1            // 启用红外遥控
+#define ENABLE_KEYBOARD 0         // 启用串口键盘指令
+#define DEBUG 1                    // 调试信息输出
+#define IR_DEBUG 0                 // 红外详细调试（关闭减少串口干扰）
 
 // ==================== 库包含 ====================
 #include <LiquidCrystal.h>
-#include <Wire.h>
-#include <QMC5883LCompass.h>
 
 #if ENABLE_INFRA
 #define EXCLUDE_EXOTIC_PROTOCOLS   // 屏蔽多余红外协议，减小代码
@@ -25,11 +22,13 @@
 #define MOTOR_B_IN2 A2
 #define MOTOR_B_PWM 10
 #define MOTOR_STBY 8
-#define OBSTACLE_PIN A0
+
+// ==================== 光电开关引脚定义（根据实际接线修正）====================
+#define PHOTO_A_PIN A4        // 电机A计数光电开关（实际接在A4）
+#define PHOTO_B_PIN A0        // 电机B发牌检测光电开关（实际接在A0）
 
 // ==================== 模块实例化 ====================
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
-QMC5883LCompass compass;
 
 #if ENABLE_INFRA
 IRrecv irrecv(IR_RECEIVE_PIN);
@@ -39,9 +38,8 @@ decode_results results;
 // ==================== 系统状态枚举 ====================
 enum SystemState {
     STATE_IDLE,
-    STATE_B_RUNNING,
-    STATE_A_RUNNING,
-    STATE_B_TIMEOUT
+    STATE_B_RUNNING,   // 发牌电机运行
+    STATE_A_RUNNING    // 旋转电机运行
 };
 
 // ==================== 全局变量 ====================
@@ -55,87 +53,34 @@ uint16_t dealtCards = 0;
 SystemState currentState = STATE_IDLE;
 bool isRunning = 0;
 
-// ---- 电机控制时间参数 ----
-unsigned long MANUAL_CIRCLE_TIME = 3050;
-unsigned long motorATimeoutPerPlayer = 763;
-unsigned long motorBTimeout = 8000;
+// ---- 电机控制参数 ----
+const int MOTOR_A_SPEED = 150;
+const int MOTOR_B_SPEED = 255;
+unsigned long motorBTimeout = 8000;      // 电机B超时保护（8秒）
+
+// ---- 旋转方向 ----
+bool clockwise = true;                    // true = 顺时针，false = 逆时针
+
+// ---- 光电开关A（旋转计数）相关 ----
+volatile uint16_t photoACount = 0;        // 当前旋转过程中累计的遮挡次数（从0开始）
+uint16_t nextStopCount = 0;               // 下一次应该停止的计数目标
+float cardsPerRevolution = 2.0;            // 每发一张牌对应的遮挡次数增量（8/玩家数）
+float accumulatedTarget = 0.0;             // 累积的目标遮挡次数（浮点）
+uint8_t lastPhotoAState = HIGH;            // 上次读取的光电A状态
+unsigned long photoADebounce = 0;          // 防抖动时间
+
+// ---- 光电开关B（发牌检测）相关 ----
+uint8_t lastPhotoBState = HIGH;
+unsigned long photoBTriggerTime = 0;       // 检测到上升沿的时间
+bool photoBTriggered = false;              // 是否已检测到牌离开
+unsigned long photoBDebounce = 0;
+const unsigned long PHOTO_B_DELAY = 200;    // 牌离开后延迟停止时间
+
+// ---- 电机B超时保护 ----
+unsigned long motorBStartTime = 0;
 
 // ---- 调试定时器 ----
 unsigned long lastDebugTime = 0;
-
-// ---- 电机运行状态 ----
-unsigned long motorStartTime = 0;
-unsigned long aMotorTimeoutStart = 0;
-unsigned long lastMotorUpdate = 0;
-const int MOTOR_CONTROL_INTERVAL = 20;
-
-// ---- 障碍传感器 ----
-unsigned long lastObstacleTime = 0;
-unsigned long obstacleDebounce = 0;
-uint8_t lastObstacleState = HIGH;
-uint8_t obstacleState = HIGH;
-bool obstacleActive = false;
-bool obstacleTriggered = false;
-
-// ---- 罗盘系统 ----
-bool compassInitialized = false;
-bool calibrationDone = false;
-unsigned long lastCompassUpdate = 0;
-const int COMPASS_UPDATE_INTERVAL = 30;
-const float MAGNETIC_DECLINATION = 5.0;
-
-float currentHeading = 0.0;
-float filteredHeading = 0.0;
-float virtualHeading = 0.0;
-float lastValidHeading = 0.0;
-unsigned long lastHeadingChangeTime = 0;
-bool compassResponding = true;
-int noChangeCount = 0;
-const int MAX_NO_CHANGE = 15;
-
-// 新增：罗盘健康状态
-bool compassHealthy = true;
-unsigned long lastSuccessfulCompassTime = 0;
-const unsigned long COMPASS_HEALTH_TIMEOUT = 500; // 500ms无成功读数则认为不健康
-
-// 罗盘滤波缓冲区（7点滑动平均）
-const int FILTER_SIZE = 7;
-float headingBuffer[FILTER_SIZE];
-int bufferIndex = 0;
-bool bufferFilled = false;
-
-// 中值滤波缓冲区（5点，用于剔除异常值）
-const int MEDIAN_SIZE = 5;
-float medianBuffer[MEDIAN_SIZE];
-int medianIndex = 0;
-bool medianFilled = false;
-
-// ---- 角度控制参数（罗盘模式）----
-float targetHeading = 0.0;
-float anglePerPlayer = 90.0;
-float angleTolerance = 6.0;          // 实际航向容忍度
-float virtualTolerance = 8.0;         // 虚拟航向辅助容忍度（稍大）
-
-// ---- 旋转状态跟踪 ----
-float rotationStartHeading = 0.0;
-unsigned long rotationStartTime = 0;
-bool rotationInProgress = false;
-
-// ---- 模式切换 ----
-bool runtimeTurnaroundMode = TURNAROUND_MODE;
-
-// ---- 超时模式动态补偿用基准（仅超时模式）----
-float timeoutInitialHeading = 0.0;   // 超时模式下的虚拟基准
-
-// ---- 堵转检测 ----
-float lastActualForStall = 0.0;
-int stallCounter = 0;
-const float STALL_THRESHOLD = 0.5;    // 变化小于0.5°认为堵转
-const int STALL_COUNT_LIMIT = 8;      // 连续8次采样不变（约160ms）
-bool stallDetected = false;
-
-// ---- 动态超时 ----
-unsigned long dynamicTimeout = 0;     // 当前旋转的动态超时时间
 
 // ---- 串口缓冲区 ----
 const int SERIAL_BUFFER_SIZE = 32;
@@ -144,58 +89,16 @@ int serialBufferIndex = 0;
 unsigned long lastSerialCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 100;
 
-// ==================== 电机速度参数 ====================
-const int MOTOR_A_SPEED = 150;
-const int MOTOR_A_CAL_SPEED = 200;
-const int MOTOR_B_SPEED = 255;
-
-// ==================== 红外键码定义 ====================
-#if ENABLE_INFRA
-#define IR_DEC_PLAYER     0xBA45FF00
-#define IR_RESET          0xB946FF00
-#define IR_INC_PLAYER     0xB847FF00
-#define IR_INC_DECK       0xBB44FF00
-#define IR_TOGGLE_JOKER   0xBF40FF00
-#define IR_START          0xBC43FF00
-#define IR_DEC_CIRCLE_TIME 0xF807FF00
-#define IR_INC_CIRCLE_TIME 0xEA15FF00
-#define IR_STOP           0xF609FF00
-#define IR_REMAIN_CARDS   0xE916FF00
-#define IR_TEST_MOTOR_A   0xE619FF00
-#define IR_TEST_MOTOR_B   0xF20DFF00
-#define IR_CALIBRATE      0xF30CFF00
-#define IR_TOGGLE_MODE    0xE718FF00
-#define IR_SYSTEM_RESET   0xA15EFF00
-#define IR_VERSION        0xF708FF00
-#define IR_BTM            0xE31CFF00
-#define IR_BTP            0xA55AFF00
-#endif
-
 // ==================== 函数声明 ====================
-float normalizeAngle(float angle);
-float getSimpleAngleDiff(float current, float target);
-float getCCWDistance(float current, float target);
 void enableMotorDriver();
 void disableMotorDriver();
 void stopAllMotors();
 void controlMotorA(bool enable);
-void controlMotorAFullSpeed();
-void controlMotorB(uint8_t state);
-void calculateMotorATimeout();
-bool readCompassHeading(float &heading);
-float updateVirtualHeadingDuringRotation();
-float getCurrentHeading();
-void updateCompassHeading();          // 增强版：中值+滑动平均
-bool initCompassUltimate();
-void i2c_release_bus();
-void calibrateCompass();
-void autoCalibrateCircleTime();
-bool rotateToAngle();                 // 改进版：带健康降级
-void handleObstacleEvent();
-void changeState(SystemState newState);
+void controlMotorB(bool enable);
 void startDealing();
 void stopDealing();
-void checkObstacle();
+void updatePhotoA();                 // 检测光电A边沿并计数
+void updatePhotoB();                 // 检测光电B上升沿
 void handleMotorState();
 void resetSystem();
 #if ENABLE_INFRA
@@ -205,32 +108,6 @@ void processSerialInput();
 void handleSerialCommand(const char* command);
 void updateDisplay();
 void showStatusMessage(const char* message);
-
-// ==================== 角度工具函数 ====================
-float normalizeAngle(float angle) {
-    while (angle >= 360.0) angle -= 360.0;
-    while (angle < 0.0) angle += 360.0;
-    return angle;
-}
-
-float getSimpleAngleDiff(float current, float target) {
-    current = normalizeAngle(current);
-    target = normalizeAngle(target);
-    float diff = target - current;
-    if (diff > 180.0) diff -= 360.0;
-    else if (diff < -180.0) diff += 360.0;
-    return diff;
-}
-
-float getCCWDistance(float current, float target) {
-    current = normalizeAngle(current);
-    target = normalizeAngle(target);
-    if (current >= target) {
-        return current - target;
-    } else {
-        return current + 360.0 - target;
-    }
-}
 
 // ==================== 电机控制函数 ====================
 void enableMotorDriver() {
@@ -252,29 +129,28 @@ void stopAllMotors() {
     delay(20);
     analogWrite(MOTOR_A_PWM, 0);
     analogWrite(MOTOR_B_PWM, 0);
-    rotationInProgress = false;
 }
 
 void controlMotorA(bool enable) {
     if (enable) {
-        digitalWrite(MOTOR_A_IN1, LOW);
-        digitalWrite(MOTOR_A_IN2, HIGH);
+        // 根据旋转方向设置电机A的转向
+        if (clockwise) {
+            // 顺时针方向
+            digitalWrite(MOTOR_A_IN1, LOW);
+            digitalWrite(MOTOR_A_IN2, HIGH);
+        } else {
+            // 逆时针方向
+            digitalWrite(MOTOR_A_IN1, HIGH);
+            digitalWrite(MOTOR_A_IN2, LOW);
+        }
         analogWrite(MOTOR_A_PWM, MOTOR_A_SPEED);
-        rotationInProgress = true;
     } else {
         stopAllMotors();
     }
 }
 
-void controlMotorAFullSpeed() {
-    digitalWrite(MOTOR_A_IN1, LOW);
-    digitalWrite(MOTOR_A_IN2, HIGH);
-    analogWrite(MOTOR_A_PWM, MOTOR_A_CAL_SPEED);
-    rotationInProgress = true;
-}
-
-void controlMotorB(uint8_t state) {
-    if (state) {
+void controlMotorB(bool enable) {
+    if (enable) {
         digitalWrite(MOTOR_B_IN1, LOW);
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED);
@@ -287,525 +163,45 @@ void controlMotorB(uint8_t state) {
     }
 }
 
-// ==================== 超时时间计算 ====================
-void calculateMotorATimeout() {
-    motorATimeoutPerPlayer = (unsigned long)((float)MANUAL_CIRCLE_TIME / playerCount + 0.5);
-    if (motorATimeoutPerPlayer < 100) motorATimeoutPerPlayer = 100;
+// ==================== 光电开关A（旋转计数）检测 ====================
+void updatePhotoA() {
+    // 只在电机A旋转时进行计数，避免误触发
+    if (currentState != STATE_A_RUNNING) return;
+
+    uint8_t currentStateA = digitalRead(PHOTO_A_PIN);
+    // 检测下降沿（遮挡发生）
+    if (currentStateA == LOW && lastPhotoAState == HIGH) {
+        if (millis() - photoADebounce > 20) { // 简单防抖
+            photoADebounce = millis();
+            photoACount++;
 #if DEBUG
-    Serial.print(F("Circle: "));
-    Serial.print(MANUAL_CIRCLE_TIME);
-    Serial.print(F("ms, Timeout/player: "));
-    Serial.print(motorATimeoutPerPlayer);
-    Serial.println(F("ms"));
+            Serial.print(F("PhotoA count: "));
+            Serial.println(photoACount);
 #endif
-}
-
-// ==================== 罗盘原始读取 ====================
-bool readCompassHeading(float &heading) {
-    if (!compassInitialized) return false;
-    compass.read();
-    int rawHeading = compass.getAzimuth();
-    if (rawHeading < 0) rawHeading += 360;
-    if (rawHeading >= 0 && rawHeading <= 360) {
-        heading = normalizeAngle(rawHeading + MAGNETIC_DECLINATION);
-        return true;
-    }
-    return false;
-}
-
-// ==================== 增强型罗盘更新（中值+滑动平均）====================
-void updateCompassHeading() {
-    if (!compassInitialized) return;
-    if (millis() - lastCompassUpdate < COMPASS_UPDATE_INTERVAL) return;
-
-    float rawHeading;
-    bool success = readCompassHeading(rawHeading);
-    if (!success) {
-        // 读取失败，标记不健康
-        if (millis() - lastSuccessfulCompassTime > COMPASS_HEALTH_TIMEOUT) {
-            compassHealthy = false;
         }
-        lastCompassUpdate = millis();
-        return;
     }
-
-    // 读取成功，更新健康状态
-    lastSuccessfulCompassTime = millis();
-    compassHealthy = true;
-
-    // 响应性检测
-    float change = fabs(rawHeading - lastValidHeading);
-    if (change > 0.5) {
-        compassResponding = true;
-        noChangeCount = 0;
-        lastHeadingChangeTime = millis();
-    } else {
-        noChangeCount++;
-        if (noChangeCount > MAX_NO_CHANGE) compassResponding = false;
-    }
-    lastValidHeading = rawHeading;
-
-    // 1. 中值滤波（5点）剔除异常跳变
-    medianBuffer[medianIndex] = rawHeading;
-    medianIndex = (medianIndex + 1) % MEDIAN_SIZE;
-    if (medianIndex == 0) medianFilled = true;
-
-    float medianHeading = rawHeading;
-    if (medianFilled) {
-        // 复制缓冲区并排序
-        float temp[MEDIAN_SIZE];
-        for (int i = 0; i < MEDIAN_SIZE; i++) temp[i] = medianBuffer[i];
-        // 简单冒泡排序
-        for (int i = 0; i < MEDIAN_SIZE-1; i++) {
-            for (int j = i+1; j < MEDIAN_SIZE; j++) {
-                if (temp[i] > temp[j]) {
-                    float t = temp[i];
-                    temp[i] = temp[j];
-                    temp[j] = t;
-                }
-            }
-        }
-        medianHeading = temp[MEDIAN_SIZE/2]; // 中值
-    }
-
-    // 2. 滑动平均（7点）作用于中值后的数据
-    headingBuffer[bufferIndex] = medianHeading;
-    bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
-    if (bufferIndex == 0) bufferFilled = true;
-
-    if (bufferFilled) {
-        float sum = 0;
-        for (int i = 0; i < FILTER_SIZE; i++) sum += headingBuffer[i];
-        filteredHeading = normalizeAngle(sum / FILTER_SIZE);
-    } else {
-        filteredHeading = medianHeading;
-    }
-
-    // 罗盘模式且电机静止时，同步虚拟航向
-    bool isMotorARunning = (currentState == STATE_A_RUNNING);
-    if (runtimeTurnaroundMode == 1 && !isMotorARunning) {
-        virtualHeading = filteredHeading;
-    }
-    // 罗盘不响应且静止时强制同步
-    if (!compassResponding && !isMotorARunning) {
-        virtualHeading = filteredHeading;
-    }
-
-    currentHeading = filteredHeading;
-    lastCompassUpdate = millis();
+    lastPhotoAState = currentStateA;
 }
 
-// ==================== 虚拟航向更新 ====================
-float updateVirtualHeadingDuringRotation() {
-    if (!rotationInProgress) return virtualHeading;
-    unsigned long elapsed = millis() - rotationStartTime;
-    float rotationSpeed = 360.0 / ((float)MANUAL_CIRCLE_TIME / 1000.0);
-    float expectedRotation = (elapsed / 1000.0) * rotationSpeed;
-    virtualHeading = normalizeAngle(rotationStartHeading - expectedRotation);
-    return virtualHeading;
-}
+// ==================== 光电开关B（发牌检测）检测 ====================
+void updatePhotoB() {
+    // 只在电机B运行时检测
+    if (currentState != STATE_B_RUNNING) return;
 
-// ==================== 获取当前航向（模式感知）====================
-float getCurrentHeading() {
-    if (runtimeTurnaroundMode == 1) {
-        if (currentState == STATE_A_RUNNING) {
-            return updateVirtualHeadingDuringRotation();
-        } else {
-            return filteredHeading;
-        }
-    } else {
-        return updateVirtualHeadingDuringRotation();
-    }
-}
-
-// ==================== 释放I2C总线 ====================
-void i2c_release_bus() {
-    pinMode(SDA, OUTPUT);
-    pinMode(SCL, OUTPUT);
-    digitalWrite(SDA, HIGH);
-    digitalWrite(SCL, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(SCL, LOW);
-    delayMicroseconds(10);
-    digitalWrite(SCL, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(SDA, LOW);
-    delayMicroseconds(10);
-    digitalWrite(SDA, HIGH);
-    delayMicroseconds(10);
-    pinMode(SDA, INPUT_PULLUP);
-    pinMode(SCL, INPUT_PULLUP);
-}
-
-// ==================== QMC5883L 初始化（带超时保护）====================
-bool initCompassUltimate() {
-    unsigned long startTime = millis();
-    const unsigned long timeout = 2000;
-
+    uint8_t currentStateB = digitalRead(PHOTO_B_PIN);
+    // 检测上升沿（从遮挡到未遮挡，即牌离开）
+    if (currentStateB == HIGH && lastPhotoBState == LOW) {
+        if (millis() - photoBDebounce > 20) {
+            photoBDebounce = millis();
+            // 记录触发时间，稍后停止电机
+            photoBTriggered = true;
+            photoBTriggerTime = millis();
 #if DEBUG
-    Serial.println(F("Init Compass..."));
+            Serial.println(F("PhotoB triggered (card left)"));
 #endif
-    lcd.clear();
-    lcd.print(F("Init Comp..."));
-    stopAllMotors();
-    disableMotorDriver();
-    delay(100);
-    Wire.end();
-    delay(50);
-
-    i2c_release_bus();
-
-    Wire.begin();
-    Wire.setClock(100000);
-    delay(200);
-
-    bool i2cConnected = false;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        if (millis() - startTime > timeout) {
-#if DEBUG
-            Serial.println(F("I2C timeout"));
-#endif
-            return false;
         }
-        Wire.beginTransmission(0x0D);
-        byte error = Wire.endTransmission();
-        if (error == 0) {
-            i2cConnected = true;
-            break;
-        }
-        delay(100);
     }
-    if (!i2cConnected) {
-        lcd.clear();
-        lcd.print(F("I2C Fail"));
-        delay(2000);
-        return false;
-    }
-
-    compass.init();
-    delay(100);
-
-    bool dataValid = false;
-    for (int i = 0; i < 5; i++) {
-        if (millis() - startTime > timeout) {
-            return false;
-        }
-        compass.read();
-        int x = compass.getX(), y = compass.getY(), z = compass.getZ();
-        if (x != 0 || y != 0 || z != 0) {
-            dataValid = true;
-            break;
-        }
-        delay(50);
-    }
-
-    compassInitialized = dataValid;
-    calibrationDone = false;
-
-    if (compassInitialized) {
-        float headingSum = 0;
-        int validHeadings = 0;
-        for (int i = 0; i < 5; i++) {
-            if (millis() - startTime > timeout) {
-                return false;
-            }
-            compass.read();
-            int rawHeading = compass.getAzimuth();
-            if (rawHeading >= 0 && rawHeading <= 360) {
-                validHeadings++;
-                headingSum += rawHeading;
-            }
-            delay(50);
-        }
-        if (validHeadings > 0) {
-            float initialReading = normalizeAngle(headingSum / validHeadings + MAGNETIC_DECLINATION);
-            currentHeading = initialReading;
-            targetHeading = initialReading;
-            filteredHeading = initialReading;
-            virtualHeading = initialReading;
-            lastValidHeading = initialReading;
-            for (int i = 0; i < FILTER_SIZE; i++) headingBuffer[i] = initialReading;
-            for (int i = 0; i < MEDIAN_SIZE; i++) medianBuffer[i] = initialReading;
-            bufferFilled = true;
-            medianFilled = true;
-        }
-        compassResponding = true;
-        noChangeCount = 0;
-        lastSuccessfulCompassTime = millis(); // 初始化成功时间
-        compassHealthy = true;
-#if DEBUG
-        Serial.print(F("Compass OK: "));
-        Serial.println(filteredHeading, 1);
-#endif
-        lcd.clear();
-        lcd.print(F("Compass OK"));
-        delay(500);
-    }
-    return compassInitialized;
-}
-
-// ==================== 罗盘校准（8字形）====================
-void calibrateCompass() {
-    if (!compassInitialized) {
-        lcd.clear();
-        lcd.print(F("Compass N/A"));
-        delay(1000);
-        return;
-    }
-    lcd.clear();
-    lcd.print(F("Calib..."));
-    stopAllMotors();
-    delay(200);
-    enableMotorDriver();
-
-    float startHeading = 0.0;
-    for (int i = 0; i < 5; i++) { updateCompassHeading(); delay(100); }
-    startHeading = getCurrentHeading();
-
-    controlMotorAFullSpeed();
-    delay(5000);
-    stopAllMotors();
-    delay(500);
-
-    float finalHeading = 0.0;
-    for (int i = 0; i < 5; i++) { updateCompassHeading(); delay(100); }
-    finalHeading = getCurrentHeading();
-
-    float avgHeading = normalizeAngle((startHeading + finalHeading) / 2.0);
-    currentHeading = avgHeading;
-    targetHeading = avgHeading;
-    filteredHeading = avgHeading;
-    virtualHeading = avgHeading;
-    lastValidHeading = avgHeading;
-    calibrationDone = true;
-    for (int i = 0; i < FILTER_SIZE; i++) headingBuffer[i] = avgHeading;
-    for (int i = 0; i < MEDIAN_SIZE; i++) medianBuffer[i] = avgHeading;
-    bufferFilled = true;
-    medianFilled = true;
-
-#if DEBUG
-    Serial.print(F("Cal done: "));
-    Serial.println(avgHeading, 1);
-#endif
-    lcd.clear();
-    lcd.print(F("Cal OK "));
-    lcd.print((int)avgHeading);
-    lcd.print(F("°"));
-    delay(1000);
-}
-
-// ==================== 自动校准整圈时间 ====================
-void autoCalibrateCircleTime() {
-    if (!compassInitialized || !calibrationDone) {
-        lcd.clear();
-        lcd.print(F("Compass first!"));
-        delay(1000);
-        return;
-    }
-    lcd.clear();
-    lcd.print(F("Cal Circle..."));
-    stopAllMotors();
-    delay(500);
-    enableMotorDriver();
-
-    for (int i = 0; i < 5; i++) { updateCompassHeading(); delay(50); }
-    float startHeading = filteredHeading;
-    rotationStartHeading = startHeading;
-    virtualHeading = startHeading;
-    controlMotorAFullSpeed();
-    unsigned long startTime = millis();
-
-    bool crossed = false;
-    unsigned long timeout = millis() + 10000;
-    while (!crossed && millis() < timeout) {
-        updateCompassHeading();
-        float current = filteredHeading;
-        float diff = getSimpleAngleDiff(startHeading, current);
-        if (fabs(diff) >= 350.0) crossed = true;
-        delay(20);
-    }
-    unsigned long endTime = millis();
-    stopAllMotors();
-
-    if (crossed) {
-        MANUAL_CIRCLE_TIME = endTime - startTime;
-        if (MANUAL_CIRCLE_TIME < 1000) MANUAL_CIRCLE_TIME = 1000;
-        calculateMotorATimeout();
-        lcd.clear();
-        lcd.print(F("Circle Cal OK"));
-        lcd.setCursor(0, 1);
-        lcd.print(MANUAL_CIRCLE_TIME);
-        lcd.print(F("ms"));
-    } else {
-        lcd.clear();
-        lcd.print(F("Cal Failed"));
-    }
-    delay(1500);
-    updateDisplay();
-}
-
-// ==================== 改进的旋转控制函数（带健康降级）====================
-bool rotateToAngle() {
-    if (millis() - lastMotorUpdate < MOTOR_CONTROL_INTERVAL) return false;
-    lastMotorUpdate = millis();
-
-    unsigned long elapsed = millis() - aMotorTimeoutStart;
-
-    // ---------- 罗盘模式：如果罗盘健康且校准完成，使用闭环控制；否则降级为超时模式 ----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
-        float currentActual = filteredHeading;
-        float currentVirtual = updateVirtualHeadingDuringRotation();
-        float diffActual = getSimpleAngleDiff(currentActual, targetHeading);
-        float diffVirtual = getSimpleAngleDiff(currentVirtual, targetHeading);
-
-#if DEBUG
-        static unsigned long lastDebugPrint = 0;
-        if (millis() - lastDebugPrint > 200) {
-            Serial.print(F("Ca:")); Serial.print(currentActual, 1);
-            Serial.print(F(" Cv:")); Serial.print(currentVirtual, 1);
-            Serial.print(F(" T:")); Serial.print(targetHeading, 1);
-            Serial.print(F(" diffA:")); Serial.print(diffActual, 1);
-            Serial.print(F(" diffV:")); Serial.println(diffVirtual, 1);
-            lastDebugPrint = millis();
-        }
-#endif
-
-        // 堵转检测：实际航向长时间不变
-        if (fabs(currentActual - lastActualForStall) < STALL_THRESHOLD) {
-            stallCounter++;
-        } else {
-            stallCounter = 0;
-            lastActualForStall = currentActual;
-        }
-        if (stallCounter >= STALL_COUNT_LIMIT) {
-            stopAllMotors();
-            stallDetected = true;
-            return true;
-        }
-
-        // 主要停止条件：实际航向到达目标
-        if (fabs(diffActual) <= angleTolerance) {
-            stopAllMotors();
-            return true;
-        }
-
-        // 辅助停止条件：虚拟航向已过目标且实际航向接近
-        if (fabs(diffVirtual) <= virtualTolerance && fabs(diffActual) <= angleTolerance * 2) {
-            stopAllMotors();
-            return true;
-        }
-
-        // 动态超时：如果 elapsed 超过理论时间的1.5倍，强制停止
-        if (elapsed >= (unsigned long)(motorATimeoutPerPlayer * 1.5)) {
-            stopAllMotors();
-            return true;
-        }
-
-        controlMotorA(true);
-        return false;
-    }
-    // ---------- 降级为超时模式：开环定时（包括罗盘模式但罗盘不健康的情况）----------
-    else {
-        // 如果当前是罗盘模式但罗盘不健康，可以打印一条警告（可选）
-        if (runtimeTurnaroundMode == 1 && (!compassHealthy || !calibrationDone)) {
-            static unsigned long lastWarn = 0;
-            if (millis() - lastWarn > 5000) {
-                Serial.println(F("Compass unhealthy, using timeout mode temporarily"));
-                lastWarn = millis();
-            }
-        }
-        if (elapsed >= motorATimeoutPerPlayer) {
-            stopAllMotors();
-            return true;
-        }
-        controlMotorA(true);
-        return false;
-    }
-}
-
-// ==================== 障碍事件处理 ====================
-void handleObstacleEvent() {
-    lastObstacleTime = millis();
-    stopAllMotors();
-    dealtCards++;
-    if (dealtCards > totalCards) dealtCards = totalCards;
-
-#if DEBUG
-    Serial.print(F("Card dealt: "));
-    Serial.println(dealtCards);
-#endif
-
-    // 重置堵转检测
-    stallCounter = 0;
-    if (compassInitialized && calibrationDone) {
-        lastActualForStall = filteredHeading;
-    }
-    stallDetected = false;
-
-    // ---------- 罗盘模式：如果罗盘健康且校准完成，使用实际航向设定目标 ----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
-        // 读取当前真实航向（多次平均）
-        float sum = 0;
-        int count = 0;
-        for (int i = 0; i < 5; i++) {
-            updateCompassHeading();
-            sum += filteredHeading;
-            count++;
-            delay(20);
-        }
-        float realHeading = normalizeAngle(sum / count);
-        rotationStartHeading = realHeading;
-        virtualHeading = realHeading;
-        targetHeading = normalizeAngle(realHeading - anglePerPlayer);
-    }
-    // ---------- 超时模式或罗盘不健康：基于虚拟基准（固定0）----------
-    else {
-        uint8_t currentPlayerIndex = dealtCards % playerCount;
-        float targetAngle = timeoutInitialHeading - (currentPlayerIndex * anglePerPlayer);
-        targetHeading = normalizeAngle(targetAngle);
-        rotationStartHeading = getCurrentHeading();
-        virtualHeading = rotationStartHeading;
-    }
-
-    rotationStartTime = millis();
-    aMotorTimeoutStart = millis();
-    lastMotorUpdate = millis();
-
-    changeState(STATE_A_RUNNING);
-    controlMotorA(true);
-
-    if (runtimeTurnaroundMode == 1) {
-        compassResponding = true;
-        noChangeCount = 0;
-        lastHeadingChangeTime = millis();
-    }
-
-    showStatusMessage("Rotate...");
-
-    if (dealtCards >= totalCards && totalCards > 0) {
-        stopDealing();
-        showStatusMessage("Done!");
-        delay(500);
-        updateDisplay();
-    }
-}
-
-// ==================== 状态切换 ====================
-void changeState(SystemState newState) {
-#if DEBUG
-    const char* stateNames[] = { "IDLE", "B_RUN", "A_RUN", "B_TO" };
-    if (currentState != newState) {
-        Serial.print(F("State: "));
-        Serial.print(stateNames[currentState]);
-        Serial.print(F("->"));
-        Serial.println(stateNames[newState]);
-    }
-#endif
-    if (newState != STATE_B_RUNNING) {
-        obstacleTriggered = false;
-        obstacleActive = false;
-    }
-    currentState = newState;
+    lastPhotoBState = currentStateB;
 }
 
 // ==================== 游戏控制 ====================
@@ -818,147 +214,87 @@ void startDealing() {
     }
     isRunning = 1;
     dealtCards = 0;
+    accumulatedTarget = 0.0;          // 重置累积目标
+    photoACount = 0;
+    nextStopCount = 0;
 
     stopAllMotors();
     enableMotorDriver();
 
-    // ---------- 罗盘模式：如果罗盘健康且校准完成，同步当前航向 ----------
-    if (runtimeTurnaroundMode == 1 && compassInitialized && calibrationDone && compassHealthy) {
-        updateCompassHeading();
-        virtualHeading = filteredHeading;
-        rotationStartHeading = filteredHeading;
-        targetHeading = filteredHeading;   // 第一张牌无需旋转（直接推牌）
-    }
-    // ---------- 超时模式或罗盘不健康：设置虚拟基准为0 ----------
-    else {
-        timeoutInitialHeading = 0;
-        virtualHeading = 0;
-        targetHeading = 0;
-        rotationStartHeading = 0;
-    }
-
-    changeState(STATE_B_RUNNING);
-    motorStartTime = millis();
-    controlMotorB(1);
-
+    // 第一张牌：直接启动电机B
+    currentState = STATE_B_RUNNING;
+    motorBStartTime = millis();
+    controlMotorB(true);
     showStatusMessage("Start");
     delay(300);
 }
 
 void stopDealing() {
     isRunning = 0;
-    changeState(STATE_IDLE);
+    currentState = STATE_IDLE;
     stopAllMotors();
     updateDisplay();
-}
-
-// ==================== 避障检测 ====================
-void checkObstacle() {
-    uint8_t newState = digitalRead(OBSTACLE_PIN);
-    if (currentState != STATE_B_RUNNING) {
-        lastObstacleState = newState;
-        obstacleState = newState;
-        return;
-    }
-    if (newState != lastObstacleState) {
-        obstacleDebounce = millis();
-    }
-    if (millis() - obstacleDebounce > 50) {
-        if (newState != obstacleState) {
-            obstacleState = newState;
-        }
-        if (obstacleState == LOW && (millis() - lastObstacleTime > 500)) {
-            handleObstacleEvent();
-        }
-    }
-    lastObstacleState = newState;
 }
 
 // ==================== 状态机处理 ====================
 void handleMotorState() {
     switch (currentState) {
         case STATE_B_RUNNING:
-            if (millis() - motorStartTime > motorBTimeout) {
-                changeState(STATE_B_TIMEOUT);
-                showStatusMessage("B Timeout");
-                delay(500);
-                stopDealing();
-            }
-            break;
-        case STATE_A_RUNNING:
-            if (rotateToAngle()) {
-                stopAllMotors();
+            // 检测光电B上升沿
+            updatePhotoB();
 
-                // 如果检测到堵转，停止发牌并显示错误
-                if (stallDetected) {
-                    showStatusMessage("Stall! Stop");
-                    delay(1000);
-                    stopDealing();
-                    break;
-                }
+            // 如果已检测到牌离开，延迟后停止电机B
+            if (photoBTriggered && (millis() - photoBTriggerTime >= PHOTO_B_DELAY)) {
+                controlMotorB(false);          // 停止电机B
+                photoBTriggered = false;
+                dealtCards++;
+                if (dealtCards > totalCards) dealtCards = totalCards;
 
-                // ---------- 超时模式动态补偿（利用罗盘修正）---------
-                if (runtimeTurnaroundMode == 0 && compassInitialized && calibrationDone && compassHealthy) {
-                    float realHeading = filteredHeading;
-                    float expectedHeading = normalizeAngle(timeoutInitialHeading - (dealtCards % playerCount) * anglePerPlayer);
-                    float angleError = getSimpleAngleDiff(realHeading, expectedHeading);
-                    const float MS_PER_DEG = (float)MANUAL_CIRCLE_TIME / 360.0;
-                    long correction = (long)(angleError * MS_PER_DEG * 0.5); // 学习因子0.5
-                    correction = constrain(correction, -50, 50);
-                    int newTimeout = (int)motorATimeoutPerPlayer - correction;
-                    motorATimeoutPerPlayer = (unsigned long)constrain(newTimeout, 200, 1200);
 #if DEBUG
-                    Serial.print(F("Angle err: ")); Serial.print(angleError, 1);
-                    Serial.print(F("°, Corr: ")); Serial.print(correction);
-                    Serial.print(F("ms, New TO: ")); Serial.println(motorATimeoutPerPlayer);
+                Serial.print(F("Card dealt: "));
+                Serial.println(dealtCards);
 #endif
-                }
-                // ----------------------------------------------------
 
-                // 发完所有牌？
+                // 检查是否发完所有牌
                 if (dealtCards >= totalCards && totalCards > 0) {
                     stopDealing();
                     showStatusMessage("All Done!");
                     delay(500);
                     updateDisplay();
-                } else {
-                    changeState(STATE_B_RUNNING);
-                    motorStartTime = millis();
-                    controlMotorB(1);
+                    break;
                 }
+
+                // 更新累积目标，准备旋转到下一位置
+                accumulatedTarget += cardsPerRevolution;
+                nextStopCount = (uint16_t)(accumulatedTarget + 0.999); // ceil
+                photoACount = 0;                 // 重置计数，开始新一圈计数
+                currentState = STATE_A_RUNNING;
+                controlMotorA(true);
+                showStatusMessage("Rotate...");
+            }
+
+            // 超时保护（如果一直没有牌发出）
+            if (millis() - motorBStartTime > motorBTimeout) {
+                stopDealing();
+                showStatusMessage("B Timeout");
+                delay(500);
+                updateDisplay();
+            }
+            break;
+
+        case STATE_A_RUNNING:
+            updatePhotoA();   // 更新旋转计数
+
+            // 检查是否达到目标计数
+            if (photoACount >= nextStopCount) {
+                controlMotorA(false);   // 停止电机A
+                currentState = STATE_B_RUNNING;
+                motorBStartTime = millis();
+                controlMotorB(true);
+                showStatusMessage("Deal...");
             }
             break;
     }
-}
-
-// ==================== 系统重启 ====================
-void resetSystem() {
-#if DEBUG
-    Serial.println(F("System Reset"));
-#endif
-    stopAllMotors();
-    disableMotorDriver();
-    isRunning = 0;
-    dealtCards = 0;
-    currentState = STATE_IDLE;
-    obstacleTriggered = false;
-    obstacleActive = false;
-    if (compassInitialized) {
-        float current = getCurrentHeading();
-        currentHeading = current;
-        targetHeading = current;
-        virtualHeading = current;
-        lastValidHeading = current;
-        filteredHeading = current;
-    }
-    serialBufferIndex = 0;
-    serialBuffer[0] = '\0';
-    lcd.clear();
-    lcd.print(F("Reset"));
-    lcd.setCursor(0, 1);
-    lcd.print(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-    delay(800);
-    updateDisplay();
 }
 
 // ==================== 红外遥控处理 ====================
@@ -975,76 +311,57 @@ void processInfraredInput() {
             return;
         }
         switch (irValue) {
-            case IR_DEC_PLAYER:
+            case 0xBA45FF00: // 减玩家
                 if (!isRunning) {
                     if (playerCount > 2) playerCount--; else playerCount = 8;
-                    anglePerPlayer = 360.0 / playerCount;
-                    calculateMotorATimeout();
+                    cardsPerRevolution = 8.0 / playerCount;
                     updateDisplay();
                 }
                 break;
-            case IR_RESET:
+            case 0xB946FF00: // 重置参数
                 if (!isRunning) {
                     playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
                     totalCards = deckCount * (hasJokers ? 54 : 52);
-                    anglePerPlayer = 360.0 / playerCount;
-                    calculateMotorATimeout();
+                    cardsPerRevolution = 8.0 / playerCount;
                     updateDisplay();
                 }
                 break;
-            case IR_INC_PLAYER:
+            case 0xB847FF00: // 加玩家
                 if (!isRunning) {
                     playerCount++; if (playerCount > 8) playerCount = 2;
-                    anglePerPlayer = 360.0 / playerCount;
-                    calculateMotorATimeout();
+                    cardsPerRevolution = 8.0 / playerCount;
                     updateDisplay();
                 }
                 break;
-            case IR_INC_DECK:
+            case 0xBB44FF00: // 加副数
                 if (!isRunning) {
                     deckCount++; if (deckCount > 3) deckCount = 1;
                     totalCards = deckCount * (hasJokers ? 54 : 52);
                     updateDisplay();
                 }
                 break;
-            case IR_TOGGLE_JOKER:
+            case 0xBF40FF00: // 切换有无王
                 if (!isRunning) {
                     hasJokers = !hasJokers;
                     totalCards = deckCount * (hasJokers ? 54 : 52);
                     updateDisplay();
                 }
                 break;
-            case IR_START:
+            case 0xBC43FF00: // 开始
                 if (!isRunning) startDealing();
                 else showStatusMessage("Running");
                 break;
-            case IR_DEC_CIRCLE_TIME:
-                if (!isRunning && MANUAL_CIRCLE_TIME > 200) {
-                    MANUAL_CIRCLE_TIME -= 100;
-                    calculateMotorATimeout();
-                    lcd.clear();
-                    lcd.print(F("Circle-100"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(MANUAL_CIRCLE_TIME);
-                    lcd.print(F("ms"));
-                    delay(800);
-                    updateDisplay();
-                }
-                break;
-            case IR_INC_CIRCLE_TIME:
+            case 0xF807FF00: // 减整圈时间（无效，保留占位）
+            case 0xEA15FF00: // 加整圈时间
                 if (!isRunning) {
-                    MANUAL_CIRCLE_TIME += 100;
-                    calculateMotorATimeout();
+                    // 新系统中圈时间不再使用，但可忽略或显示提示
                     lcd.clear();
-                    lcd.print(F("Circle+100"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(MANUAL_CIRCLE_TIME);
-                    lcd.print(F("ms"));
+                    lcd.print(F("No circle time"));
                     delay(800);
                     updateDisplay();
                 }
                 break;
-            case IR_STOP:
+            case 0xF609FF00: // 停止
                 if (isRunning) stopDealing();
                 else {
                     lcd.clear();
@@ -1053,7 +370,7 @@ void processInfraredInput() {
                     updateDisplay();
                 }
                 break;
-            case IR_REMAIN_CARDS:
+            case 0xE916FF00: // 设置剩余牌
                 if (!isRunning) {
                     remainCards += playerCount;
                     if (remainCards > playerCount * 4) remainCards = 0;
@@ -1062,98 +379,85 @@ void processInfraredInput() {
                     updateDisplay();
                 }
                 break;
-            case IR_TEST_MOTOR_A:
+            case 0xE619FF00: // 测试电机A
                 if (!isRunning) {
                     enableMotorDriver();
-                    float startAngle = getCurrentHeading();
-                    float testTarget = normalizeAngle(startAngle - 90);
                     lcd.clear();
-                    lcd.print(F("90° Test"));
+                    lcd.print(F("MotorA Test"));
                     lcd.setCursor(0, 1);
-                    lcd.print(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-                    rotationStartHeading = startAngle;
-                    rotationStartTime = millis();
-                    aMotorTimeoutStart = millis();
-                    targetHeading = testTarget;
+                    lcd.print(F("Wait count..."));
+                    photoACount = 0;
+                    nextStopCount = 2; // 简单测试，转两个遮挡停
                     controlMotorA(true);
                     unsigned long testStart = millis();
                     bool testComplete = false;
                     while (!testComplete && millis() - testStart < 10000) {
-                        if (rotateToAngle()) testComplete = true;
-                        delay(10);
-                    }
-                    if (!testComplete) stopAllMotors();
-                    float endAngle = getCurrentHeading();
-                    float actualRotation = getSimpleAngleDiff(startAngle, endAngle);
-                    lcd.clear();
-                    lcd.print(F("Rot:"));
-                    lcd.print((int)actualRotation);
-                    lcd.print(F("°"));
-                    delay(500);
-                    updateDisplay();
-                }
-                break;
-            case IR_TEST_MOTOR_B:
-                if (!isRunning) {
-                    enableMotorDriver();
-                    controlMotorB(1);
-                    lcd.clear();
-                    lcd.print(F("MotorB Test"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(F("Wait Obstacle..."));
-                    unsigned long testStart = millis();
-                    bool obstacleDetected = false;
-                    while (millis() - testStart < 5000) {
-                        if (digitalRead(OBSTACLE_PIN) == LOW) {
-                            delay(50);
-                            if (digitalRead(OBSTACLE_PIN) == LOW) {
-                                obstacleDetected = true;
-                                break;
-                            }
+                        updatePhotoA();
+                        if (photoACount >= nextStopCount) {
+                            controlMotorA(false);
+                            testComplete = true;
                         }
                         delay(10);
                     }
-                    stopAllMotors();
+                    if (!testComplete) stopAllMotors();
                     lcd.clear();
-                    if (obstacleDetected) lcd.print(F("B Test OK"));
-                    else lcd.print(F("B Timeout"));
+                    lcd.print(F("Test done"));
                     delay(800);
                     updateDisplay();
                 }
                 break;
-            case IR_CALIBRATE:
-                if (!isRunning && compassInitialized) {
-                    calibrateCompass();
+            case 0xF20DFF00: // 测试电机B
+                if (!isRunning) {
+                    enableMotorDriver();
+                    controlMotorB(true);
+                    lcd.clear();
+                    lcd.print(F("MotorB Test"));
+                    lcd.setCursor(0, 1);
+                    lcd.print(F("Wait card..."));
+                    unsigned long testStart = millis();
+                    bool cardDetected = false;
+                    photoBTriggered = false;
+                    while (millis() - testStart < 5000) {
+                        updatePhotoB();
+                        if (photoBTriggered) {
+                            cardDetected = true;
+                            break;
+                        }
+                        delay(10);
+                    }
+                    controlMotorB(false);
+                    lcd.clear();
+                    if (cardDetected) lcd.print(F("B OK"));
+                    else lcd.print(F("B TO"));
+                    delay(800);
                     updateDisplay();
                 }
                 break;
-            case IR_TOGGLE_MODE:
-                runtimeTurnaroundMode = !runtimeTurnaroundMode;
-                lcd.clear();
-                lcd.print(F("Mode:"));
-                lcd.print(runtimeTurnaroundMode == 1 ? F("C") : F("T"));
-                delay(800);
-                updateDisplay();
-#if DEBUG
-                Serial.print(F("Mode: "));
-                Serial.println(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-#endif
+            case 0xE718FF00: // 原模式切换键 -> 现改为切换旋转方向
+                if (!isRunning) {
+                    clockwise = !clockwise; // 切换方向
+                    lcd.clear();
+                    lcd.print(F("Direction:"));
+                    lcd.setCursor(0, 1);
+                    lcd.print(clockwise ? F("CW") : F("CCW"));
+                    delay(800);
+                    updateDisplay();
+                }
                 break;
-            case IR_SYSTEM_RESET:
+            case 0xA15EFF00: // 系统复位
                 resetSystem();
                 break;
-            case IR_VERSION:
+            case 0xF708FF00: // 版本信息
                 lcd.clear();
-                lcd.print(F("Dealer v34.0"));
+                lcd.print(F("Dealer v36.0"));
                 lcd.setCursor(0, 1);
-                lcd.print(F("HybridSafe"));
+                lcd.print(F("DirSwitch"));
                 delay(800);
                 updateDisplay();
                 break;
-            case IR_BTP:
+            case 0xE31CFF00: // 减B超时
                 if (!isRunning) {
-                    motorBTimeout += 1000;
-                    if (motorBTimeout > 15000) motorBTimeout = 8000;
+                    if (motorBTimeout > 2000) motorBTimeout -= 1000; else motorBTimeout = 8000;
                     lcd.clear();
                     lcd.print(F("B Tout:"));
                     lcd.print(motorBTimeout / 1000);
@@ -1162,9 +466,10 @@ void processInfraredInput() {
                     updateDisplay();
                 }
                 break;
-            case IR_BTM:
+            case 0xA55AFF00: // 加B超时
                 if (!isRunning) {
-                    if (motorBTimeout > 2000) motorBTimeout -= 1000; else motorBTimeout = 8000;
+                    motorBTimeout += 1000;
+                    if (motorBTimeout > 15000) motorBTimeout = 8000;
                     lcd.clear();
                     lcd.print(F("B Tout:"));
                     lcd.print(motorBTimeout / 1000);
@@ -1213,33 +518,25 @@ void processSerialInput() {
 void handleSerialCommand(const char* command) {
 #if ENABLE_KEYBOARD
     if (command[0] >= '0' && command[0] <= '9') {
-        long timeValue = atol(command);
-        if (timeValue >= 100 && timeValue <= 10000) {
-            MANUAL_CIRCLE_TIME = timeValue;
-            calculateMotorATimeout();
-            lcd.clear();
-            lcd.print(F("Circle Set"));
-            lcd.setCursor(0, 1);
-            lcd.print(MANUAL_CIRCLE_TIME);
-            lcd.print(F("ms"));
-            delay(800);
-            updateDisplay();
-            return;
-        }
+        // 数字命令不再用于设置圈时间
+        lcd.clear();
+        lcd.print(F("Not supported"));
+        delay(800);
+        updateDisplay();
+        return;
     }
     switch (command[0]) {
         case 'v': case 'V':
             lcd.clear();
-            lcd.print(F("Dealer v34.0"));
+            lcd.print(F("Dealer v36.0"));
             lcd.setCursor(0, 1);
-            lcd.print(F("HybridSafe"));
+            lcd.print(F("DirSwitch"));
             delay(800);
             updateDisplay();
             break;
         case 'p': case 'P':
             playerCount++; if (playerCount > 8) playerCount = 2;
-            anglePerPlayer = 360.0 / playerCount;
-            calculateMotorATimeout();
+            cardsPerRevolution = 8.0 / playerCount;
             updateDisplay();
             break;
         case 'd': case 'D':
@@ -1267,8 +564,7 @@ void handleSerialCommand(const char* command) {
             playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
             stopDealing();
             totalCards = deckCount * (hasJokers ? 54 : 52);
-            anglePerPlayer = 360.0 / playerCount;
-            calculateMotorATimeout();
+            cardsPerRevolution = 8.0 / playerCount;
             updateDisplay();
             break;
         case 't': case 'T':
@@ -1276,7 +572,7 @@ void handleSerialCommand(const char* command) {
             else {
                 stopAllMotors();
                 disableMotorDriver();
-                changeState(STATE_IDLE);
+                currentState = STATE_IDLE;
                 lcd.clear();
                 lcd.print(F("Stop"));
                 delay(800);
@@ -1286,113 +582,81 @@ void handleSerialCommand(const char* command) {
         case 'a': case 'A':
             if (!isRunning) {
                 enableMotorDriver();
-                float startAngle = getCurrentHeading();
-                float testTarget = normalizeAngle(startAngle - 90);
                 lcd.clear();
-                lcd.print(F("90° Test"));
+                lcd.print(F("MotorA Test"));
                 lcd.setCursor(0, 1);
-                lcd.print(runtimeTurnaroundMode == 1 ? F("C") : F("T"));
-                rotationStartHeading = startAngle;
-                rotationStartTime = millis();
-                aMotorTimeoutStart = millis();
-                targetHeading = testTarget;
+                lcd.print(F("Wait count..."));
+                photoACount = 0;
+                nextStopCount = 2;
                 controlMotorA(true);
                 unsigned long testStart = millis();
                 bool testComplete = false;
                 while (!testComplete && millis() - testStart < 10000) {
-                    if (rotateToAngle()) testComplete = true;
+                    updatePhotoA();
+                    if (photoACount >= nextStopCount) {
+                        controlMotorA(false);
+                        testComplete = true;
+                    }
                     delay(10);
                 }
                 if (!testComplete) stopAllMotors();
-                float endAngle = getCurrentHeading();
-                float actualRotation = getSimpleAngleDiff(startAngle, endAngle);
                 lcd.clear();
-                lcd.print(F("Rot:"));
-                lcd.print((int)actualRotation);
-                lcd.print(F("°"));
-                delay(500);
+                lcd.print(F("Test done"));
+                delay(800);
                 updateDisplay();
             }
             break;
         case 'b': case 'B':
             if (!isRunning) {
                 enableMotorDriver();
-                controlMotorB(1);
+                controlMotorB(true);
                 lcd.clear();
                 lcd.print(F("MotorB Test"));
                 lcd.setCursor(0, 1);
-                lcd.print(F("Wait Ob..."));
+                lcd.print(F("Wait card..."));
                 unsigned long testStart = millis();
-                bool obstacleDetected = false;
+                bool cardDetected = false;
+                photoBTriggered = false;
                 while (millis() - testStart < 5000) {
-                    if (digitalRead(OBSTACLE_PIN) == LOW) {
-                        delay(50);
-                        if (digitalRead(OBSTACLE_PIN) == LOW) {
-                            obstacleDetected = true;
-                            break;
-                        }
+                    updatePhotoB();
+                    if (photoBTriggered) {
+                        cardDetected = true;
+                        break;
                     }
                     delay(10);
                 }
-                stopAllMotors();
+                controlMotorB(false);
                 lcd.clear();
-                if (obstacleDetected) lcd.print(F("B OK"));
+                if (cardDetected) lcd.print(F("B OK"));
                 else lcd.print(F("B TO"));
                 delay(800);
                 updateDisplay();
             }
             break;
-        case 'l': case 'L':
-            if (!isRunning && compassInitialized) {
-                calibrateCompass();
-                updateDisplay();
-            }
-            break;
-        case 'm': case 'M':
-            runtimeTurnaroundMode = !runtimeTurnaroundMode;
-            lcd.clear();
-            lcd.print(F("Mode:"));
-            lcd.print(runtimeTurnaroundMode == 1 ? F("C") : F("T"));
-            delay(800);
-            updateDisplay();
-#if DEBUG
-            Serial.print(F("Mode: "));
-            Serial.println(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-#endif
-            break;
-        case 'z': case 'Z':
-            resetSystem();
-            break;
-        case '+':
-            MANUAL_CIRCLE_TIME += 100;
-            calculateMotorATimeout();
-            lcd.clear();
-            lcd.print(F("Circle+100"));
-            lcd.setCursor(0, 1);
-            lcd.print(MANUAL_CIRCLE_TIME);
-            lcd.print(F("ms"));
-            delay(800);
-            updateDisplay();
-            break;
-        case '-':
-            if (MANUAL_CIRCLE_TIME > 200) {
-                MANUAL_CIRCLE_TIME -= 100;
-                calculateMotorATimeout();
+        case 'm': case 'M':   // 原模式切换 -> 现改为切换方向
+            if (!isRunning) {
+                clockwise = !clockwise;
                 lcd.clear();
-                lcd.print(F("Circle-100"));
+                lcd.print(F("Direction:"));
                 lcd.setCursor(0, 1);
-                lcd.print(MANUAL_CIRCLE_TIME);
-                lcd.print(F("ms"));
+                lcd.print(clockwise ? F("CW") : F("CCW"));
                 delay(800);
                 updateDisplay();
             }
             break;
+        case 'z': case 'Z':
+            resetSystem();
+            break;
+        case '+': case '-':
+            // 圈时间调整无效
+            lcd.clear();
+            lcd.print(F("No circle adj"));
+            delay(800);
+            updateDisplay();
+            break;
         case 'h': case 'H':
-            Serial.println(F("=== Card Dealer Cmds ==="));
-            Serial.println(F("V/D/J/R/S/C/T/A/B/L/M/Z/+/-"));
-            Serial.print(F("Circle: "));
-            Serial.print(MANUAL_CIRCLE_TIME);
-            Serial.println(F("ms"));
+            Serial.println(F("=== Card Dealer Cmds (Photo ver) ==="));
+            Serial.println(F("P/D/J/R/S/C/T/A/B/M/Z/H"));
             break;
         default:
             lcd.clear();
@@ -1404,44 +668,64 @@ void handleSerialCommand(const char* command) {
 #endif
 }
 
+// ==================== 系统重启 ====================
+void resetSystem() {
+#if DEBUG
+    Serial.println(F("System Reset"));
+#endif
+    stopAllMotors();
+    disableMotorDriver();
+    isRunning = 0;
+    dealtCards = 0;
+    currentState = STATE_IDLE;
+    photoACount = 0;
+    nextStopCount = 0;
+    accumulatedTarget = 0.0;
+    photoBTriggered = false;
+    serialBufferIndex = 0;
+    serialBuffer[0] = '\0';
+    lcd.clear();
+    lcd.print(F("Reset"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Photo Mode"));
+    delay(800);
+    updateDisplay();
+}
+
 // ==================== LCD 显示 ====================
 void updateDisplay() {
     lcd.clear();
-    // 第一行：Px Dx J/N M:C/T 圈时间
+    // 第一行：Px Dx J 剩余牌数 方向
     lcd.setCursor(0, 0);
     lcd.print(F("P"));
     lcd.print(playerCount);
     lcd.print(F(" D"));
     lcd.print(deckCount);
-    lcd.print(hasJokers ? F(" J") : F(" N"));
-    lcd.print(F(" M:"));
-    lcd.print(runtimeTurnaroundMode == 1 ? F("C") : F("T"));
-    lcd.setCursor(10, 0);
-    lcd.print(MANUAL_CIRCLE_TIME);
-    // 第二行：总牌/已发 状态 航向
+    lcd.print(F(" "));
+    lcd.print(hasJokers ? F("J") : F("N"));
+    lcd.print(F(" R"));
+    lcd.print(totalCards - dealtCards);
+    lcd.print(F(" "));
+    lcd.print(clockwise ? F("CW") : F("CC"));
+
+    // 第二行：已发/总数 状态 计数
     lcd.setCursor(0, 1);
-    lcd.print(F("T:"));
-    lcd.print(totalCards);
-    lcd.print(F(" D:"));
+    lcd.print(F("D:"));
     lcd.print(dealtCards);
+    lcd.print(F("/"));
+    lcd.print(totalCards);
     lcd.print(F(" "));
     if (isRunning) {
         switch (currentState) {
             case STATE_B_RUNNING: lcd.print(F("B")); break;
             case STATE_A_RUNNING: lcd.print(F("A")); break;
-            case STATE_B_TIMEOUT: lcd.print(F("TO")); break;
             default: lcd.print(F("R"));
         }
     } else {
         lcd.print(F("S"));
     }
-    lcd.print(F(" "));
-    lcd.print(obstacleState == HIGH ? F("H") : F("L"));
-    lcd.setCursor(12, 1);
-    int intAngle = (int)getCurrentHeading();
-    if (intAngle < 100) lcd.print(F("0"));
-    if (intAngle < 10) lcd.print(F("0"));
-    lcd.print(intAngle);
+    lcd.print(F(" C:"));
+    lcd.print(photoACount);
 }
 
 void showStatusMessage(const char* message) {
@@ -1465,74 +749,33 @@ void setup() {
     pinMode(MOTOR_B_IN2, OUTPUT);
     pinMode(MOTOR_B_PWM, OUTPUT);
     pinMode(MOTOR_STBY, OUTPUT);
-    pinMode(OBSTACLE_PIN, INPUT_PULLUP);
+    pinMode(PHOTO_A_PIN, INPUT_PULLUP);
+    pinMode(PHOTO_B_PIN, INPUT_PULLUP);
     disableMotorDriver();
 
     lcd.begin(16, 2);
     lcd.clear();
-    lcd.print(F("Dealer v34.0"));
+    lcd.print(F("Dealer v36.0"));
     lcd.setCursor(0, 1);
-    lcd.print(F("HybridSafe"));
+    lcd.print(F("DirSwitch"));
 
 #if DEBUG
     Serial.begin(9600);
     delay(500);
-    Serial.println(F("=== System Startup ==="));
-    Serial.println(F("Hybrid Safe Mode"));
-    Serial.print(F("Init mode: "));
-    Serial.println(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-    Serial.print(F("Circle: "));
-    Serial.print(MANUAL_CIRCLE_TIME);
-    Serial.println(F("ms"));
-    Serial.println(F("Use 'H' help"));
+    Serial.println(F("=== System Startup (Photo Switch + Direction) ==="));
+    Serial.println(F("Players: 2-8, Direction: CW (default)"));
 #endif
 
 #if ENABLE_INFRA
     IrReceiver.begin(IR_RECEIVE_PIN);
 #endif
 
-    Wire.begin();
-    delay(100);
-
-    compassInitialized = false;
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        lcd.clear();
-        lcd.print(F("Init Comp"));
-        lcd.setCursor(0, 1);
-        lcd.print(F("Try "));
-        lcd.print(attempt);
-        compassInitialized = initCompassUltimate();
-        if (compassInitialized) break;
-        delay(1000);
-    }
-
-    if (compassInitialized) {
-        delay(500);
-        calibrateCompass();
-        if (!calibrationDone) {
-            lcd.clear();
-            lcd.print(F("Cal Fail"));
-            lcd.setCursor(0, 1);
-            lcd.print(F("Use Timeout"));
-            delay(1000);
-        }
-    } else {
-        lcd.clear();
-        lcd.print(F("No Compass"));
-        lcd.setCursor(0, 1);
-        lcd.print(F("Timeout Mode"));
-        delay(1000);
-        calibrationDone = false;
-    }
-
+    // 初始化参数
     totalCards = deckCount * (hasJokers ? 54 : 52);
-    anglePerPlayer = 360.0 / playerCount;
-    calculateMotorATimeout();
+    cardsPerRevolution = 8.0 / playerCount;
 
-    obstacleState = digitalRead(OBSTACLE_PIN);
-    lastObstacleState = obstacleState;
-    compassResponding = true;
-    noChangeCount = 0;
+    lastPhotoAState = digitalRead(PHOTO_A_PIN);
+    lastPhotoBState = digitalRead(PHOTO_B_PIN);
 
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
@@ -1544,8 +787,6 @@ void setup() {
     Serial.println(playerCount);
     Serial.print(F("Cards: "));
     Serial.println(totalCards);
-    Serial.print(F("Compass: "));
-    Serial.println(compassInitialized ? F("YES") : F("NO"));
     Serial.println(F("========================"));
 #endif
 }
@@ -1556,12 +797,8 @@ void loop() {
 #if ENABLE_INFRA
     processInfraredInput();
 #endif
-    checkObstacle();
     if (isRunning) {
         handleMotorState();
-    }
-    if (runtimeTurnaroundMode == 1) {
-        updateCompassHeading();
     }
 #if DEBUG
     if (millis() - lastDebugTime > 3000) {
@@ -1569,13 +806,14 @@ void loop() {
         Serial.print(dealtCards);
         Serial.print(F("/"));
         Serial.print(totalCards);
-        Serial.print(F(" Mode: "));
-        Serial.print(runtimeTurnaroundMode == 1 ? F("Compass") : F("Timeout"));
-        if (compassInitialized) {
-            Serial.print(F(" Hdg:"));
-            Serial.print(getCurrentHeading(), 1);
-        }
-        Serial.println();
+        Serial.print(F(" State:"));
+        Serial.print(currentState == STATE_B_RUNNING ? "B" : (currentState == STATE_A_RUNNING ? "A" : "I"));
+        Serial.print(F(" Dir:"));
+        Serial.print(clockwise ? "CW" : "CC");
+        Serial.print(F(" PhotoA cnt:"));
+        Serial.print(photoACount);
+        Serial.print(F(" NextStop:"));
+        Serial.println(nextStopCount);
         lastDebugTime = millis();
     }
 #endif
