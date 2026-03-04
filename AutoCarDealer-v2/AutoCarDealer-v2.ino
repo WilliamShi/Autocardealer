@@ -51,12 +51,13 @@ uint8_t hasJokers = 1;
 uint16_t totalCards = 54 * 3;
 uint16_t dealtCards = 0;
 SystemState currentState = STATE_IDLE;
-bool isRunning = 0;
+uint8_t isRunning = 0;          // 0:停止 1:运行 2:暂停
 
 // ---- 电机控制参数 ----
-const int MOTOR_A_SPEED = 150;
+const int MOTOR_A_SPEED = 255;
 const int MOTOR_B_SPEED = 255;
 unsigned long motorBTimeout = 8000;      // 电机B超时保护（8秒）
+unsigned long motorATimeout = 10000;      // 电机A超时保护（10秒）
 
 // ---- 旋转方向 ----
 bool clockwise = true;                    // true = 顺时针，false = 逆时针
@@ -64,10 +65,9 @@ bool clockwise = true;                    // true = 顺时针，false = 逆时�
 // ---- 光电开关A（旋转计数）相关 ----
 volatile uint16_t photoACount = 0;        // 当前旋转过程中累计的遮挡次数（从0开始）
 uint16_t nextStopCount = 0;               // 下一次应该停止的计数目标
-float cardsPerRevolution = 2.0;            // 每发一张牌对应的遮挡次数增量（8/玩家数）
-float accumulatedTarget = 0.0;             // 累积的目标遮挡次数（浮点）
 uint8_t lastPhotoAState = HIGH;            // 上次读取的光电A状态
 unsigned long photoADebounce = 0;          // 防抖动时间
+unsigned long motorAStartTime = 0;         // 电机A开始旋转的时间（用于超时）
 
 // ---- 光电开关B（发牌检测）相关 ----
 uint8_t lastPhotoBState = HIGH;
@@ -89,6 +89,20 @@ int serialBufferIndex = 0;
 unsigned long lastSerialCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 100;
 
+// ==================== 基础位置表（第0圈）====================
+// 索引为玩家数，每个数组存储对应玩家数的第0圈位置（顺序与玩家顺序一致）
+const uint8_t basePositions[9][8] = {
+    {0},           // 占位，不使用
+    {0},           // 玩家数1（未使用）
+    {0, 4},        // 玩家2
+    {0, 2, 5},     // 玩家3
+    {0, 2, 4, 6},  // 玩家4
+    {0, 2, 4, 5, 6}, // 玩家5
+    {0, 2, 3, 4, 6, 7}, // 玩家6
+    {0, 1, 2, 3, 4, 5, 6}, // 玩家7
+    {0, 1, 2, 3, 4, 5, 6, 7}  // 玩家8
+};
+
 // ==================== 函数声明 ====================
 void enableMotorDriver();
 void disableMotorDriver();
@@ -96,11 +110,14 @@ void stopAllMotors();
 void controlMotorA(bool enable);
 void controlMotorB(bool enable);
 void startDealing();
+void pauseDealing();
+void resumeDealing();
 void stopDealing();
 void updatePhotoA();                 // 检测光电A边沿并计数
 void updatePhotoB();                 // 检测光电B上升沿
 void handleMotorState();
 void resetSystem();
+void performInitialHoming();          // 上电归位：寻找第一个下降沿
 #if ENABLE_INFRA
 void processInfraredInput();
 #endif
@@ -108,6 +125,7 @@ void processSerialInput();
 void handleSerialCommand(const char* command);
 void updateDisplay();
 void showStatusMessage(const char* message);
+void updateNextStopCount();           // 根据当前已发牌数计算下一个停止计数值
 
 // ==================== 电机控制函数 ====================
 void enableMotorDriver() {
@@ -144,6 +162,7 @@ void controlMotorA(bool enable) {
             digitalWrite(MOTOR_A_IN2, LOW);
         }
         analogWrite(MOTOR_A_PWM, MOTOR_A_SPEED);
+        motorAStartTime = millis();   // 记录开始时间，用于超时
     } else {
         stopAllMotors();
     }
@@ -169,7 +188,7 @@ void updatePhotoA() {
     if (currentState != STATE_A_RUNNING) return;
 
     uint8_t currentStateA = digitalRead(PHOTO_A_PIN);
-    // 检测下降沿（遮挡发生）
+    // 检测下降沿（从HIGH到LOW，对应遮挡物离开）
     if (currentStateA == LOW && lastPhotoAState == HIGH) {
         if (millis() - photoADebounce > 20) { // 简单防抖
             photoADebounce = millis();
@@ -190,7 +209,7 @@ void updatePhotoB() {
 
     uint8_t currentStateB = digitalRead(PHOTO_B_PIN);
     // 检测上升沿（从遮挡到未遮挡，即牌离开）
-    if (currentStateB == HIGH && lastPhotoBState == LOW) {
+    if (currentStateB == LOW && lastPhotoBState == HIGH) {
         if (millis() - photoBDebounce > 20) {
             photoBDebounce = millis();
             // 记录触发时间，稍后停止电机
@@ -204,35 +223,176 @@ void updatePhotoB() {
     lastPhotoBState = currentStateB;
 }
 
-// ==================== 游戏控制 ====================
-void startDealing() {
-    if (totalCards <= 0) {
-        showStatusMessage("No Cards!");
-        delay(500);
-        updateDisplay();
-        return;
-    }
-    isRunning = 1;
-    dealtCards = 0;
-    accumulatedTarget = 0.0;          // 重置累积目标
-    photoACount = 0;
-    nextStopCount = 0;
-
-    stopAllMotors();
+// ==================== 上电归位：寻找第一个下降沿 ====================
+void performInitialHoming() {
     enableMotorDriver();
+    delay(100);
 
-    // 第一张牌：直接启动电机B
-    currentState = STATE_B_RUNNING;
-    motorBStartTime = millis();
+    // 电机A归位：旋转直到第一个下降沿
+    lcd.clear();
+    lcd.print("Homing MotorA...");
+    controlMotorA(true);
+    unsigned long startTime = millis();
+    uint8_t lastState = digitalRead(PHOTO_A_PIN);
+    bool found = false;
+    while (millis() - startTime < 10000) { // 超时10秒
+        uint8_t curState = digitalRead(PHOTO_A_PIN);
+        if (curState == LOW && lastState == HIGH) { // 下降沿
+            found = true;
+            break;
+        }
+        lastState = curState;
+        delay(10);
+    }
+    controlMotorA(false);
+    lcd.setCursor(0, 1);
+    if (found) {
+        lcd.print("A OK");
+    } else {
+        lcd.print("A TO");
+    }
+    delay(500);
+/*
+    // 电机B归位：旋转直到第一个下降沿
+    lcd.clear();
+    lcd.print("Homing MotorB...");
     controlMotorB(true);
-    showStatusMessage("Start");
-    delay(300);
+    startTime = millis();
+    lastState = digitalRead(PHOTO_B_PIN);
+    found = false;
+    while (millis() - startTime < 10000) {
+        uint8_t curState = digitalRead(PHOTO_B_PIN);
+        if (curState == LOW && lastState == HIGH) { // 下降沿
+            found = true;
+            break;
+        }
+        lastState = curState;
+        delay(10);
+    }
+    controlMotorB(false);
+    lcd.setCursor(0, 1);
+    if (found) {
+        lcd.print("B OK");
+    } else {
+        lcd.print("B TO");
+    }
+    delay(500);
+*/
+    lcd.clear();
 }
 
+// ==================== 计算下一次停止计数（精确查表）====================
+void updateNextStopCount() {
+    if (playerCount < 2 || playerCount > 8) return; // 安全保护
+
+    // 下一张牌的索引 = 当前已发牌数（因为下一张就是第dealtCards张，从0开始）
+    uint16_t nextIndex = dealtCards;
+    uint8_t circle = nextIndex / playerCount;          // 第几圈（每圈有playerCount张牌）
+    uint8_t posInCircle = nextIndex % playerCount;     // 圈内位置
+    nextStopCount = basePositions[playerCount][posInCircle] + circle * 8;
+
+#if DEBUG
+    Serial.print(F("Next stop: "));
+    Serial.print(nextStopCount);
+    Serial.print(F(" (index="));
+    Serial.print(nextIndex);
+    Serial.print(F(", circle="));
+    Serial.print(circle);
+    Serial.print(F(", pos="));
+    Serial.print(posInCircle);
+    Serial.println(F(")"));
+#endif
+}
+
+// ==================== 暂停发牌 ====================
+void pauseDealing() {
+    if (isRunning == 1) {          // 仅在运行状态可暂停
+        stopAllMotors();            // 停止电机，保留所有计数变量
+        isRunning = 2;              // 进入暂停状态
+#if DEBUG
+        Serial.println(F("Paused"));
+#endif
+        updateDisplay();
+    }
+}
+
+// ==================== 恢复发牌 ====================
+void resumeDealing() {
+    if (isRunning == 2) {          // 仅在暂停状态可恢复
+        enableMotorDriver();        // 确保驱动已使能
+        // 根据之前的状态恢复电机
+        if (currentState == STATE_B_RUNNING) {
+            if (photoBTriggered) {
+                // 已在等待延迟，不需要启动电机B，但需重置超时计时防止误触发
+                motorBStartTime = 0;  // 超时检查将失效，由延迟逻辑接管
+            } else {
+                // 重新启动电机B
+                lastPhotoBState = digitalRead(PHOTO_B_PIN); // 刷新当前电平
+                controlMotorB(true);
+                motorBStartTime = millis();
+            }
+        } else if (currentState == STATE_A_RUNNING) {
+            // 重新启动电机A
+            lastPhotoAState = digitalRead(PHOTO_A_PIN); // 刷新当前电平
+            controlMotorA(true);
+            motorAStartTime = millis();
+        } else {
+            // 意外状态，默认回到发牌阶段
+            currentState = STATE_B_RUNNING;
+            controlMotorB(true);
+            motorBStartTime = millis();
+        }
+        isRunning = 1;              // 恢复运行
+#if DEBUG
+        Serial.println(F("Resumed"));
+#endif
+        updateDisplay();
+    }
+}
+
+// ==================== 开始发牌（多态：开始/暂停/恢复）====================
+void startDealing() {
+    if (isRunning == 0) {
+        // 全新开始
+        if (totalCards <= 0) {
+            showStatusMessage("No Cards!");
+            delay(500);
+            updateDisplay();
+            return;
+        }
+        isRunning = 1;
+        dealtCards = 0;
+        photoACount = 0;
+        nextStopCount = 0;           // 第一张牌不旋转，目标为0
+
+        stopAllMotors();
+        enableMotorDriver();
+
+        // 第一张牌：直接启动电机B
+        currentState = STATE_B_RUNNING;
+        motorBStartTime = millis();
+        controlMotorB(true);
+        showStatusMessage("Start");
+        delay(300);
+    } else if (isRunning == 1) {
+        // 运行中 -> 暂停
+        pauseDealing();
+    } else if (isRunning == 2) {
+        // 暂停中 -> 恢复
+        resumeDealing();
+    }
+}
+
+// ==================== 完全停止发牌（重置所有状态）====================
 void stopDealing() {
     isRunning = 0;
     currentState = STATE_IDLE;
+    photoACount = 0;
+    nextStopCount = 0;
+    dealtCards = 0;                  // 重置已发牌数
+    photoBTriggered = false;
     stopAllMotors();
+    // 可选：disableMotorDriver();  // 如需省电可取消注释
     updateDisplay();
 }
 
@@ -264,18 +424,16 @@ void handleMotorState() {
                     break;
                 }
 
-                // 更新累积目标，准备旋转到下一位置
-                accumulatedTarget += cardsPerRevolution;
-                nextStopCount = (uint16_t)(accumulatedTarget + 0.999); // ceil
-                photoACount = 0;                 // 重置计数，开始新一圈计数
+                // 计算下一次应该停止的计数目标（精确查表）
+                updateNextStopCount();
                 currentState = STATE_A_RUNNING;
                 controlMotorA(true);
                 showStatusMessage("Rotate...");
             }
 
-            // 超时保护（如果一直没有牌发出）
-            if (millis() - motorBStartTime > motorBTimeout) {
-                stopDealing();
+            // 超时保护（如果一直没有牌发出）-> 暂停而非停止
+            if (millis() - motorBStartTime > motorBTimeout && isRunning == 1) {
+                pauseDealing();
                 showStatusMessage("B Timeout");
                 delay(500);
                 updateDisplay();
@@ -283,7 +441,7 @@ void handleMotorState() {
             break;
 
         case STATE_A_RUNNING:
-            updatePhotoA();   // 更新旋转计数
+            updatePhotoA();   // 更新旋转计数（下降沿计数）
 
             // 检查是否达到目标计数
             if (photoACount >= nextStopCount) {
@@ -292,6 +450,16 @@ void handleMotorState() {
                 motorBStartTime = millis();
                 controlMotorB(true);
                 showStatusMessage("Deal...");
+                break;
+            }
+
+            // 电机A超时保护（防止计数不准导致无限旋转）-> 暂停
+            if (millis() - motorAStartTime > motorATimeout && isRunning == 1) {
+                controlMotorA(false);
+                pauseDealing();
+                showStatusMessage("A Timeout");
+                delay(500);
+                updateDisplay();
             }
             break;
     }
@@ -310,173 +478,153 @@ void processInfraredInput() {
             IrReceiver.resume();
             return;
         }
+        // 非空闲状态（运行或暂停）只响应停止键和发牌键
+        if (isRunning != 0) {
+            if (irValue == 0xF609FF00) { // 停止
+                stopDealing();
+            } else if (irValue == 0xBC43FF00) { // 发牌键（开始/暂停/恢复）
+                startDealing();
+            }
+            IrReceiver.resume();
+            return;
+        }
+
+        // 空闲状态处理所有键
         switch (irValue) {
             case 0xBA45FF00: // 减玩家
-                if (!isRunning) {
-                    if (playerCount > 2) playerCount--; else playerCount = 8;
-                    cardsPerRevolution = 8.0 / playerCount;
-                    updateDisplay();
-                }
+                if (playerCount > 2) playerCount--; else playerCount = 8;
+                updateDisplay();
                 break;
             case 0xB946FF00: // 重置参数
-                if (!isRunning) {
-                    playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
-                    totalCards = deckCount * (hasJokers ? 54 : 52);
-                    cardsPerRevolution = 8.0 / playerCount;
-                    updateDisplay();
-                }
+                playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
+                totalCards = deckCount * (hasJokers ? 54 : 52);
+                updateDisplay();
                 break;
             case 0xB847FF00: // 加玩家
-                if (!isRunning) {
-                    playerCount++; if (playerCount > 8) playerCount = 2;
-                    cardsPerRevolution = 8.0 / playerCount;
-                    updateDisplay();
-                }
+                playerCount++; if (playerCount > 8) playerCount = 2;
+                updateDisplay();
                 break;
             case 0xBB44FF00: // 加副数
-                if (!isRunning) {
-                    deckCount++; if (deckCount > 3) deckCount = 1;
-                    totalCards = deckCount * (hasJokers ? 54 : 52);
-                    updateDisplay();
-                }
+                deckCount++; if (deckCount > 3) deckCount = 1;
+                totalCards = deckCount * (hasJokers ? 54 : 52);
+                updateDisplay();
                 break;
             case 0xBF40FF00: // 切换有无王
-                if (!isRunning) {
-                    hasJokers = !hasJokers;
-                    totalCards = deckCount * (hasJokers ? 54 : 52);
-                    updateDisplay();
-                }
+                hasJokers = !hasJokers;
+                totalCards = deckCount * (hasJokers ? 54 : 52);
+                updateDisplay();
                 break;
-            case 0xBC43FF00: // 开始
-                if (!isRunning) startDealing();
-                else showStatusMessage("Running");
+            case 0xBC43FF00: // 开始（空闲时正常开始）
+                startDealing();
                 break;
-            case 0xF807FF00: // 减整圈时间（无效，保留占位）
+            case 0xF807FF00: // 减整圈时间（无效）
             case 0xEA15FF00: // 加整圈时间
-                if (!isRunning) {
-                    // 新系统中圈时间不再使用，但可忽略或显示提示
-                    lcd.clear();
-                    lcd.print(F("No circle time"));
-                    delay(800);
-                    updateDisplay();
-                }
+                lcd.clear();
+                lcd.print(F("No circle time"));
+                delay(800);
+                updateDisplay();
                 break;
-            case 0xF609FF00: // 停止
-                if (isRunning) stopDealing();
-                else {
-                    lcd.clear();
-                    lcd.print(F("Idle"));
-                    delay(800);
-                    updateDisplay();
-                }
+            case 0xF609FF00: // 停止（空闲时显示空闲）
+                lcd.clear();
+                lcd.print(F("Idle"));
+                delay(800);
+                updateDisplay();
                 break;
             case 0xE916FF00: // 设置剩余牌
-                if (!isRunning) {
-                    remainCards += playerCount;
-                    if (remainCards > playerCount * 4) remainCards = 0;
-                    totalCards = deckCount * (hasJokers ? 54 : 52);
-                    if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
-                    updateDisplay();
-                }
+                remainCards += playerCount;
+                if (remainCards > playerCount * 4) remainCards = 0;
+                totalCards = deckCount * (hasJokers ? 54 : 52);
+                if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
+                updateDisplay();
                 break;
             case 0xE619FF00: // 测试电机A
-                if (!isRunning) {
-                    enableMotorDriver();
-                    lcd.clear();
-                    lcd.print(F("MotorA Test"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(F("Wait count..."));
-                    photoACount = 0;
-                    nextStopCount = 2; // 简单测试，转两个遮挡停
-                    controlMotorA(true);
-                    unsigned long testStart = millis();
-                    bool testComplete = false;
-                    while (!testComplete && millis() - testStart < 10000) {
-                        updatePhotoA();
-                        if (photoACount >= nextStopCount) {
-                            controlMotorA(false);
-                            testComplete = true;
-                        }
-                        delay(10);
+                enableMotorDriver();
+                lcd.clear();
+                lcd.print(F("MotorA Test"));
+                lcd.setCursor(0, 1);
+                lcd.print(F("Wait count..."));
+                photoACount = 0;
+                nextStopCount = 2; // 简单测试，转两个遮挡停
+                controlMotorA(true);
+                unsigned long testStart = millis();
+                bool testComplete = false;
+                while (!testComplete && millis() - testStart < 10000) {
+                    updatePhotoA();
+                    if (photoACount >= nextStopCount) {
+                        controlMotorA(false);
+                        testComplete = true;
                     }
-                    if (!testComplete) stopAllMotors();
-                    lcd.clear();
-                    lcd.print(F("Test done"));
-                    delay(800);
-                    updateDisplay();
+                    delay(10);
                 }
+                if (!testComplete) stopAllMotors();
+                lcd.clear();
+                lcd.print(F("Test done"));
+                delay(800);
+                updateDisplay();
                 break;
             case 0xF20DFF00: // 测试电机B
-                if (!isRunning) {
-                    enableMotorDriver();
-                    controlMotorB(true);
-                    lcd.clear();
-                    lcd.print(F("MotorB Test"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(F("Wait card..."));
-                    unsigned long testStart = millis();
-                    bool cardDetected = false;
-                    photoBTriggered = false;
-                    while (millis() - testStart < 5000) {
-                        updatePhotoB();
-                        if (photoBTriggered) {
-                            cardDetected = true;
-                            break;
-                        }
-                        delay(10);
+                enableMotorDriver();
+                controlMotorB(true);
+                lcd.clear();
+                lcd.print(F("MotorB Test"));
+                lcd.setCursor(0, 1);
+                lcd.print(F("Wait card..."));
+                unsigned long testStartB = millis();
+                bool cardDetected = false;
+                photoBTriggered = false;
+                while (millis() - testStartB < 5000) {
+                    updatePhotoB();
+                    if (photoBTriggered) {
+                        cardDetected = true;
+                        break;
                     }
-                    controlMotorB(false);
-                    lcd.clear();
-                    if (cardDetected) lcd.print(F("B OK"));
-                    else lcd.print(F("B TO"));
-                    delay(800);
-                    updateDisplay();
+                    delay(10);
                 }
+                controlMotorB(false);
+                lcd.clear();
+                if (cardDetected) lcd.print(F("B OK"));
+                else lcd.print(F("B TO"));
+                delay(800);
+                updateDisplay();
                 break;
-            case 0xE718FF00: // 原模式切换键 -> 现改为切换旋转方向
-                if (!isRunning) {
-                    clockwise = !clockwise; // 切换方向
-                    lcd.clear();
-                    lcd.print(F("Direction:"));
-                    lcd.setCursor(0, 1);
-                    lcd.print(clockwise ? F("CW") : F("CCW"));
-                    delay(800);
-                    updateDisplay();
-                }
+            case 0xE718FF00: // 切换旋转方向
+                clockwise = !clockwise;
+                lcd.clear();
+                lcd.print(F("Direction:"));
+                lcd.setCursor(0, 1);
+                lcd.print(clockwise ? F("CW") : F("CCW"));
+                delay(800);
+                updateDisplay();
                 break;
             case 0xA15EFF00: // 系统复位
                 resetSystem();
                 break;
             case 0xF708FF00: // 版本信息
                 lcd.clear();
-                lcd.print(F("Dealer v36.0"));
+                lcd.print(F("Dealer v39.4"));
                 lcd.setCursor(0, 1);
-                lcd.print(F("DirSwitch"));
+                lcd.print(F("Homing"));
                 delay(800);
                 updateDisplay();
                 break;
             case 0xE31CFF00: // 减B超时
-                if (!isRunning) {
-                    if (motorBTimeout > 2000) motorBTimeout -= 1000; else motorBTimeout = 8000;
-                    lcd.clear();
-                    lcd.print(F("B Tout:"));
-                    lcd.print(motorBTimeout / 1000);
-                    lcd.print(F("s"));
-                    delay(800);
-                    updateDisplay();
-                }
+                if (motorBTimeout > 2000) motorBTimeout -= 1000; else motorBTimeout = 8000;
+                lcd.clear();
+                lcd.print(F("B Tout:"));
+                lcd.print(motorBTimeout / 1000);
+                lcd.print(F("s"));
+                delay(800);
+                updateDisplay();
                 break;
             case 0xA55AFF00: // 加B超时
-                if (!isRunning) {
-                    motorBTimeout += 1000;
-                    if (motorBTimeout > 15000) motorBTimeout = 8000;
-                    lcd.clear();
-                    lcd.print(F("B Tout:"));
-                    lcd.print(motorBTimeout / 1000);
-                    lcd.print(F("s"));
-                    delay(800);
-                    updateDisplay();
-                }
+                motorBTimeout += 1000;
+                if (motorBTimeout > 15000) motorBTimeout = 8000;
+                lcd.clear();
+                lcd.print(F("B Tout:"));
+                lcd.print(motorBTimeout / 1000);
+                lcd.print(F("s"));
+                delay(800);
+                updateDisplay();
                 break;
             default:
 #if IR_DEBUG
@@ -518,7 +666,6 @@ void processSerialInput() {
 void handleSerialCommand(const char* command) {
 #if ENABLE_KEYBOARD
     if (command[0] >= '0' && command[0] <= '9') {
-        // 数字命令不再用于设置圈时间
         lcd.clear();
         lcd.print(F("Not supported"));
         delay(800);
@@ -528,15 +675,14 @@ void handleSerialCommand(const char* command) {
     switch (command[0]) {
         case 'v': case 'V':
             lcd.clear();
-            lcd.print(F("Dealer v36.0"));
+            lcd.print(F("Dealer v39.4"));
             lcd.setCursor(0, 1);
-            lcd.print(F("DirSwitch"));
+            lcd.print(F("Homing"));
             delay(800);
             updateDisplay();
             break;
         case 'p': case 'P':
             playerCount++; if (playerCount > 8) playerCount = 2;
-            cardsPerRevolution = 8.0 / playerCount;
             updateDisplay();
             break;
         case 'd': case 'D':
@@ -557,27 +703,16 @@ void handleSerialCommand(const char* command) {
             updateDisplay();
             break;
         case 's': case 'S':
-            if (!isRunning) startDealing();
-            else showStatusMessage("Running");
+            startDealing();
             break;
         case 'c': case 'C':
             playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
             stopDealing();
             totalCards = deckCount * (hasJokers ? 54 : 52);
-            cardsPerRevolution = 8.0 / playerCount;
             updateDisplay();
             break;
         case 't': case 'T':
-            if (isRunning) stopDealing();
-            else {
-                stopAllMotors();
-                disableMotorDriver();
-                currentState = STATE_IDLE;
-                lcd.clear();
-                lcd.print(F("Stop"));
-                delay(800);
-                updateDisplay();
-            }
+            stopDealing();
             break;
         case 'a': case 'A':
             if (!isRunning) {
@@ -633,29 +768,26 @@ void handleSerialCommand(const char* command) {
                 updateDisplay();
             }
             break;
-        case 'm': case 'M':   // 原模式切换 -> 现改为切换方向
-            if (!isRunning) {
-                clockwise = !clockwise;
-                lcd.clear();
-                lcd.print(F("Direction:"));
-                lcd.setCursor(0, 1);
-                lcd.print(clockwise ? F("CW") : F("CCW"));
-                delay(800);
-                updateDisplay();
-            }
+        case 'm': case 'M':   // 切换方向
+            clockwise = !clockwise;
+            lcd.clear();
+            lcd.print(F("Direction:"));
+            lcd.setCursor(0, 1);
+            lcd.print(clockwise ? F("CW") : F("CCW"));
+            delay(800);
+            updateDisplay();
             break;
         case 'z': case 'Z':
             resetSystem();
             break;
         case '+': case '-':
-            // 圈时间调整无效
             lcd.clear();
             lcd.print(F("No circle adj"));
             delay(800);
             updateDisplay();
             break;
         case 'h': case 'H':
-            Serial.println(F("=== Card Dealer Cmds (Photo ver) ==="));
+            Serial.println(F("=== Card Dealer Cmds (Homing) ==="));
             Serial.println(F("P/D/J/R/S/C/T/A/B/M/Z/H"));
             break;
         default:
@@ -680,14 +812,13 @@ void resetSystem() {
     currentState = STATE_IDLE;
     photoACount = 0;
     nextStopCount = 0;
-    accumulatedTarget = 0.0;
     photoBTriggered = false;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
     lcd.clear();
     lcd.print(F("Reset"));
     lcd.setCursor(0, 1);
-    lcd.print(F("Photo Mode"));
+    lcd.print(F("Homing"));
     delay(800);
     updateDisplay();
 }
@@ -715,12 +846,14 @@ void updateDisplay() {
     lcd.print(F("/"));
     lcd.print(totalCards);
     lcd.print(F(" "));
-    if (isRunning) {
+    if (isRunning == 1) {
         switch (currentState) {
             case STATE_B_RUNNING: lcd.print(F("B")); break;
             case STATE_A_RUNNING: lcd.print(F("A")); break;
             default: lcd.print(F("R"));
         }
+    } else if (isRunning == 2) {
+        lcd.print(F("P"));  // 暂停状态
     } else {
         lcd.print(F("S"));
     }
@@ -755,14 +888,14 @@ void setup() {
 
     lcd.begin(16, 2);
     lcd.clear();
-    lcd.print(F("Dealer v36.0"));
+    lcd.print(F("Dealer v39.4"));
     lcd.setCursor(0, 1);
-    lcd.print(F("DirSwitch"));
+    lcd.print(F("Homing"));
 
 #if DEBUG
     Serial.begin(9600);
     delay(500);
-    Serial.println(F("=== System Startup (Photo Switch + Direction) ==="));
+    Serial.println(F("=== System Startup (Homing) ==="));
     Serial.println(F("Players: 2-8, Direction: CW (default)"));
 #endif
 
@@ -772,13 +905,15 @@ void setup() {
 
     // 初始化参数
     totalCards = deckCount * (hasJokers ? 54 : 52);
-    cardsPerRevolution = 8.0 / playerCount;
 
     lastPhotoAState = digitalRead(PHOTO_A_PIN);
     lastPhotoBState = digitalRead(PHOTO_B_PIN);
 
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
+
+    // 执行上电归位
+    performInitialHoming();
 
     updateDisplay();
 
@@ -797,7 +932,7 @@ void loop() {
 #if ENABLE_INFRA
     processInfraredInput();
 #endif
-    if (isRunning) {
+    if (isRunning == 1) {   // 仅在运行状态处理电机
         handleMotorState();
     }
 #if DEBUG
@@ -813,7 +948,9 @@ void loop() {
         Serial.print(F(" PhotoA cnt:"));
         Serial.print(photoACount);
         Serial.print(F(" NextStop:"));
-        Serial.println(nextStopCount);
+        Serial.print(nextStopCount);
+        Serial.print(F(" isRunning:"));
+        Serial.println(isRunning);
         lastDebugTime = millis();
     }
 #endif
