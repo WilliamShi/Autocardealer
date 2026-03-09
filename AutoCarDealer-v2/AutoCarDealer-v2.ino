@@ -1,9 +1,9 @@
 // ==================== 系统配置宏 ====================
 #define ENABLE_INFRA 1            // 启用红外遥控
 #define ENABLE_INFRA2 1           // 启用第二个红外遥控（默认关闭，需手动设为1）
-#define ENABLE_KEYBOARD 1         // 启用串口键盘指令
+#define ENABLE_KEYBOARD 0         // 启用串口键盘指令
 #define DEBUG 1                    // 调试信息输出
-#define IR_DEBUG 1                 // 红外详细调试（关闭减少串口干扰）
+#define IR_DEBUG 0                 // 红外详细调试（关闭减少串口干扰）
 
 // ==================== 脉冲宽度检测阈值（ms）====================
 #define MIN_CARD_PULSE 20    // 最小有效脉冲宽度，小于此值视为干扰
@@ -89,11 +89,11 @@ uint8_t isRunning = 0;          // 0:停止 1:运行 2:暂停
 // ---- 电机控制参数 ----
 const int MOTOR_A_SPEED = 255;
 const int MOTOR_B_SPEED = 255;
-unsigned long motorBTimeout = 8000;      // 电机B超时保护（8秒，基于最后出牌时间）
-unsigned long motorATimeout = 10000;      // 电机A超时保护（10秒）
+unsigned long motorBTimeout = 6000;      // 电机B超时保护（8秒，基于最后出牌时间）
+unsigned long motorATimeout = 3000;      // 电机A超时保护（10秒）
 
-// ---- 旋转方向 ----
-bool clockwise = true;
+// ---- 旋转方向（true=顺时针，false=逆时针）----
+bool clockwise = false;  // 修改：缺省方向改为顺时针
 
 // ---- 光电开关A相关 ----
 volatile uint16_t photoACount = 0;
@@ -121,17 +121,18 @@ int serialBufferIndex = 0;
 unsigned long lastSerialCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 100;
 
-// ==================== 基础位置表（第0圈）====================
-const uint8_t basePositions[9][8] = {
-    {0},
-    {0},
-    {0, 4},
-    {0, 2, 5},
-    {0, 2, 4, 6},
-    {0, 2, 4, 5, 6},
-    {0, 2, 3, 4, 6, 7},
-    {0, 1, 2, 3, 4, 5, 6},
-    {0, 1, 2, 3, 4, 5, 6, 7}
+// ==================== 新：基于16计数每圈的发牌位置表 ====================
+// 数组索引为玩家人数（2~8），每行最多8个元素（按需使用）
+const uint8_t basePositions16[9][8] = {
+    {0},       // 0人（未用）
+    {0},       // 1人（未用）
+    {0, 8},    // 2人
+    {0, 5, 11}, // 3人
+    {0, 4, 8, 12}, // 4人
+    {0, 3, 7, 10, 13}, // 5人
+    {0, 3, 6, 8, 11, 14}, // 6人
+    {0, 3, 5, 7, 9, 11, 13}, // 7人
+    {0, 2, 4, 6, 8, 10, 12, 14} // 8人
 };
 
 // ==================== 函数声明 ====================
@@ -222,16 +223,18 @@ void controlMotorB(bool enable) {
     }
 }
 
-// ==================== 光电开关A计数 ====================
+// ==================== 光电开关A计数（双边沿检测）====================
 void updatePhotoA() {
     if (currentState != STATE_A_RUNNING) return;
 
     uint8_t currentStateA = digitalRead(PHOTO_A_PIN);
-    if (currentStateA == LOW && lastPhotoAState == HIGH) {
+    // 检测电平变化（上升沿或下降沿）
+    if (currentStateA != lastPhotoAState) {
+        // 防抖：确保变化稳定
         if (millis() - photoADebounce > 10) {
             photoADebounce = millis();
-            photoACount++;
-            lastPhotoATime = millis();       // 更新最后计数时间
+            photoACount++;                 // 每次变化计数一次
+            lastPhotoATime = millis();      // 更新最后计数时间
 #if DEBUG
             Serial.print(F("PhotoA count: "));
             Serial.println(photoACount);
@@ -420,14 +423,15 @@ void resetDealCounts() {
     updateDisplay();
 }
 
-// ==================== 计算下一次停止计数 ====================
+// ==================== 计算下一次停止计数（基于16计数每圈）====================
 void updateNextStopCount() {
     if (playerCount < 2 || playerCount > 8) return;
 
     uint16_t nextIndex = dealtCards;
     uint8_t circle = nextIndex / playerCount;
     uint8_t posInCircle = nextIndex % playerCount;
-    nextStopCount = basePositions[playerCount][posInCircle] + circle * 8;
+    // 使用新的16计数位置表，每圈加16
+    nextStopCount = basePositions16[playerCount][posInCircle] + circle * 16;
 
 #if DEBUG
     Serial.print(F("Next stop: "));
@@ -796,9 +800,9 @@ void processInfraredInput() {
 #if ENABLE_INFRA
         if (irValue == IR_VERSION) {
             lcd.clear();
-            lcd.print(F("Dealer v40.3"));
+            lcd.print(F("Dealer v40.4"));  // 版本号微调
             lcd.setCursor(0, 1);
-            lcd.print(F("Pulse Detect"));
+            lcd.print(F("16-edge mode"));
             delay(800);
             updateDisplay();
         } else
@@ -851,9 +855,9 @@ void handleSerialCommand(const char* command) {
     switch (command[0]) {
         case 'v': case 'V':
             lcd.clear();
-            lcd.print(F("Dealer v40.3"));
+            lcd.print(F("Dealer v40.4"));
             lcd.setCursor(0, 1);
-            lcd.print(F("Pulse Detect"));
+            lcd.print(F("16-edge mode"));
             delay(800);
             updateDisplay();
             break;
@@ -1071,14 +1075,14 @@ void setup() {
 
     lcd.begin(16, 2);
     lcd.clear();
-    lcd.print(F("Dealer v40.3"));
+    lcd.print(F("Dealer v40.4"));
     lcd.setCursor(0, 1);
     lcd.print(F("Homing"));
 
 #if DEBUG
     Serial.begin(9600);
     delay(500);
-    Serial.println(F("=== System Startup (Single Card Mode) ==="));
+    Serial.println(F("=== System Startup (16-edge mode) ==="));
     Serial.println(F("Players: 2-8, Direction: CW (default)"));
 #endif
 
