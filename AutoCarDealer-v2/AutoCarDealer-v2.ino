@@ -27,7 +27,7 @@
 #define IR_VERSION        0xF708FF00 //4
 #define IR_REBOOT         0xB54AFF00 //重启键（按钮9）
 
-// 新增比分调整键（请用IR_DEBUG获取实际值后替换0x????????）
+// 新增比分调整键（已用IR_DEBUG获取实际值）
 #define IR_SCORE_X_INC    0xE31CFF00 // 按钮5：X加1
 #define IR_SCORE_X_DEC    0xA55AFF00 // 按钮6：X减1
 #define IR_SCORE_Y_INC    0xBD42FF00 // 按钮7：Y加1
@@ -96,8 +96,8 @@ uint8_t isRunning = 0;          // 0:停止 1:运行 2:暂停
 // ---- 电机控制参数 ----
 const int MOTOR_A_SPEED = 255;
 const int MOTOR_B_SPEED = 255;
-unsigned long motorBTimeout = 6000;      // 电机B超时保护（8秒，基于最后出牌时间）
-unsigned long motorATimeout = 3000;      // 电机A超时保护（10秒）
+unsigned long motorBTimeout = 6000;      // 电机B超时保护（6秒，基于最后出牌时间）
+unsigned long motorATimeout = 3000;      // 电机A超时保护（3秒）
 
 // ---- 旋转方向（true=顺时针，false=逆时针）----
 bool clockwise = true;  // 缺省方向改为顺时针
@@ -179,7 +179,7 @@ void updateDisplay();
 void showStatusMessage(const char* message);
 void updateNextStopCount();
 
-// ==================== 电机控制函数 ====================
+// ==================== 电机控制函数（优化快速停止）====================
 void enableMotorDriver() {
     digitalWrite(MOTOR_STBY, HIGH);
     delay(10);
@@ -190,15 +190,14 @@ void disableMotorDriver() {
 }
 
 void stopAllMotors() {
+    // 直接停止，减少延时
     digitalWrite(MOTOR_A_IN1, HIGH);
     digitalWrite(MOTOR_A_IN2, HIGH);
-    analogWrite(MOTOR_A_PWM, 255);
+    analogWrite(MOTOR_A_PWM, 0);
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, HIGH);
-    analogWrite(MOTOR_B_PWM, 255);
-    delay(20);
-    analogWrite(MOTOR_A_PWM, 0);
     analogWrite(MOTOR_B_PWM, 0);
+    delay(10);  // 略微等待电机惯性停止，可减小
 }
 
 void controlMotorA(bool enable) {
@@ -219,10 +218,9 @@ void controlMotorA(bool enable) {
         lastPhotoATime = millis();
         delayMicroseconds(500);
     } else {
+        // 快速停止
         digitalWrite(MOTOR_A_IN1, HIGH);
         digitalWrite(MOTOR_A_IN2, HIGH);
-        analogWrite(MOTOR_A_PWM, 255);
-        delay(5);
         analogWrite(MOTOR_A_PWM, 0);
     }
 }
@@ -233,10 +231,9 @@ void controlMotorB(bool enable) {
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED);
     } else {
+        // 快速停止
         digitalWrite(MOTOR_B_IN1, HIGH);
         digitalWrite(MOTOR_B_IN2, HIGH);
-        analogWrite(MOTOR_B_PWM, 255);
-        delay(5);
         analogWrite(MOTOR_B_PWM, 0);
     }
 }
@@ -309,9 +306,9 @@ void updatePhotoB() {
     lastPhotoBState = currentStateB;
 }
 
-// ==================== 处理一张牌发出 ====================
+// ==================== 处理一张牌发出（优化：缩短消隐）====================
 void processCard() {
-    cardIgnoreUntil = millis() + 500;
+    cardIgnoreUntil = millis() + 300;  // 消隐窗口从500ms减至300ms
     dealtCards++;
     lastCardTime = millis();
 
@@ -328,7 +325,8 @@ void processCard() {
         return;
     }
 
-    controlMotorB(false);
+    controlMotorB(false);          // 快速停止电机B
+    // 不添加额外延时，立即计算并决定下一步
     updateNextStopCount();
 
     if (nextStopCount > photoACount) {
@@ -1044,7 +1042,7 @@ void handleSerialCommand(const char* command) {
 #endif
 }
 
-// ==================== 系统重启 ====================
+// ==================== 系统重启（保留用于其他场景）====================
 void resetSystem() {
 #if DEBUG
     Serial.println(F("System Reset"));
