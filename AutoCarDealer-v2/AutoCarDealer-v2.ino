@@ -190,14 +190,13 @@ void disableMotorDriver() {
 }
 
 void stopAllMotors() {
-    // 直接停止，减少延时
     digitalWrite(MOTOR_A_IN1, HIGH);
     digitalWrite(MOTOR_A_IN2, HIGH);
     analogWrite(MOTOR_A_PWM, 0);
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, 0);
-    delay(10);  // 略微等待电机惯性停止，可减小
+    delay(10);  // 略微等待电机惯性停止
 }
 
 void controlMotorA(bool enable) {
@@ -218,7 +217,6 @@ void controlMotorA(bool enable) {
         lastPhotoATime = millis();
         delayMicroseconds(500);
     } else {
-        // 快速停止
         digitalWrite(MOTOR_A_IN1, HIGH);
         digitalWrite(MOTOR_A_IN2, HIGH);
         analogWrite(MOTOR_A_PWM, 0);
@@ -231,7 +229,6 @@ void controlMotorB(bool enable) {
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED);
     } else {
-        // 快速停止
         digitalWrite(MOTOR_B_IN1, HIGH);
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, 0);
@@ -306,9 +303,9 @@ void updatePhotoB() {
     lastPhotoBState = currentStateB;
 }
 
-// ==================== 处理一张牌发出（优化：缩短消隐）====================
+// ==================== 处理一张牌发出（优化：电机B不停止）====================
 void processCard() {
-    cardIgnoreUntil = millis() + 300;  // 消隐窗口从500ms减至300ms
+    cardIgnoreUntil = millis() + 300;  // 消隐窗口300ms
     dealtCards++;
     lastCardTime = millis();
 
@@ -325,15 +322,15 @@ void processCard() {
         return;
     }
 
-    controlMotorB(false);          // 快速停止电机B
-    // 不添加额外延时，立即计算并决定下一步
+    // 电机B保持转动，不停止
     updateNextStopCount();
 
+    // 如果需要旋转，启动电机A（电机B继续转）
     if (nextStopCount > photoACount) {
         controlMotorA(true);
         currentState = STATE_A_RUNNING;
     } else {
-        controlMotorB(true);
+        // 不需要旋转，电机B继续转，状态保持B_RUNNING
         currentState = STATE_B_RUNNING;
     }
 }
@@ -456,9 +453,10 @@ void pauseDealing() {
 void resumeDealing() {
     if (isRunning == 2) {
         enableMotorDriver();
-        if (currentState == STATE_B_RUNNING) {
-            controlMotorB(true);
-        } else if (currentState == STATE_A_RUNNING) {
+        // 恢复时先启动电机B（常转）
+        controlMotorB(true);
+        if (currentState == STATE_A_RUNNING) {
+            // 如果之前是在旋转状态，也要启动电机A
             controlMotorA(true);
         }
         isRunning = 1;
@@ -487,6 +485,7 @@ void startDealing() {
         stopAllMotors();
         enableMotorDriver();
 
+        // 启动电机B并保持运转
         controlMotorB(true);
         lastCardTime = millis();
         currentState = STATE_B_RUNNING;
@@ -512,8 +511,9 @@ void stopDealing() {
     updateDisplay();
 }
 
-// ==================== 状态机处理 ====================
+// ==================== 状态机处理（电机B常转）====================
 void handleMotorState() {
+    // 电机B超时检测（基于最后出牌时间）
     if (isRunning == 1 && (millis() - lastCardTime > motorBTimeout)) {
         pauseDealing();
         showStatusMessage("B Timeout");
@@ -524,22 +524,24 @@ void handleMotorState() {
 
     switch (currentState) {
         case STATE_B_RUNNING:
-            updatePhotoB();
+            updatePhotoB();  // 检测出牌
             break;
 
         case STATE_A_RUNNING:
-            updatePhotoA();
+            updatePhotoA();  // 检测旋转计数
 
+            // 检查是否达到目标
             if (photoACount >= nextStopCount) {
-                controlMotorA(false);
+                controlMotorA(false);  // 停止电机A
                 if (dealtCards < totalCards) {
-                    controlMotorB(true);
+                    // 电机B继续转，状态切回B_RUNNING
                     currentState = STATE_B_RUNNING;
                 } else {
-                    stopDealing();
+                    stopDealing();  // 发完牌停止
                 }
             }
 
+            // 电机A停滞检测
             if (millis() - lastPhotoATime > 1000 && photoACount < nextStopCount) {
                 controlMotorA(false);
                 pauseDealing();
@@ -548,6 +550,7 @@ void handleMotorState() {
                 updateDisplay();
             }
 
+            // 电机A超时保护
             if (millis() - motorAStartTime > motorATimeout && isRunning == 1) {
                 controlMotorA(false);
                 pauseDealing();
@@ -818,13 +821,13 @@ void processInfraredInput() {
         } else
 #endif
 #if ENABLE_INFRA
-        // 修改：重启键 IR_REBOOT 改为调用 resetFunc()
+        // 重启键 IR_REBOOT 调用 resetFunc()
         if (irValue == IR_REBOOT) {
 #if IR_DEBUG
             Serial.println(F("Rebooting via resetFunc..."));
 #endif
-            delay(100); // 确保串口输出完成
-            resetFunc(); // 软件复位
+            delay(100);
+            resetFunc();
         } else
 #endif
 #if ENABLE_INFRA
