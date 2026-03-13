@@ -461,6 +461,15 @@ void pauseDealing() {
 void resumeDealing() {
     if (isRunning == 2) {
         enableMotorDriver();
+        
+        // 重置所有与超时相关的计时器，防止恢复后立即再次超时
+        lastCardTime = millis();               // 电机B超时计时
+        if (currentState == STATE_A_RUNNING) {
+            motorAStartTime = millis();        // 电机A超时计时
+            lastPhotoATime = millis();          // 电机A停滞检测计时
+        }
+        cardIgnoreUntil = 0;                    // 清除消隐窗口，确保光电B立即生效
+        
         // 恢复时先启动电机B（常转）
         controlMotorB(true);
         if (currentState == STATE_A_RUNNING) {
