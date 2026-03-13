@@ -438,11 +438,16 @@ void updateNextStopCount() {
 #endif
 }
 
-// ==================== 暂停/恢复 ====================
+// ==================== 暂停/恢复（增加LCD复位）====================
 void pauseDealing() {
     if (isRunning == 1) {
         stopAllMotors();
         isRunning = 2;
+        
+        // 等待电源稳定并重新初始化LCD
+        delay(100);
+        lcd.begin(16, 2);
+        
 #if DEBUG
         Serial.println(F("Paused"));
 #endif
@@ -460,6 +465,10 @@ void resumeDealing() {
             controlMotorA(true);
         }
         isRunning = 1;
+        
+        // 重新初始化LCD（可选）
+        lcd.begin(16, 2);
+        
 #if DEBUG
         Serial.println(F("Resumed"));
 #endif
@@ -499,7 +508,7 @@ void startDealing() {
     }
 }
 
-// ==================== 完全停止 ====================
+// ==================== 完全停止（增加LCD复位）====================
 void stopDealing() {
     isRunning = 0;
     currentState = STATE_IDLE;
@@ -508,6 +517,13 @@ void stopDealing() {
     dealtCards = 0;
     cardIgnoreUntil = 0;
     stopAllMotors();
+    
+    // 等待电源稳定
+    delay(100);
+    
+    // 重新初始化LCD，确保其恢复正常
+    lcd.begin(16, 2);
+    
     updateDisplay();
 }
 
@@ -1045,7 +1061,7 @@ void handleSerialCommand(const char* command) {
 #endif
 }
 
-// ==================== 系统重启（保留用于其他场景）====================
+// ==================== 系统重启（增加LCD复位）====================
 void resetSystem() {
 #if DEBUG
     Serial.println(F("System Reset"));
@@ -1060,6 +1076,9 @@ void resetSystem() {
     cardIgnoreUntil = 0;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
+    
+    // 重新初始化LCD
+    lcd.begin(16, 2);
     lcd.clear();
     lcd.print(F("Reset"));
     lcd.setCursor(0, 1);
