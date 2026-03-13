@@ -314,6 +314,9 @@ void processCard() {
     Serial.println(dealtCards);
 #endif
 
+    // 每发一张牌立即更新LCD显示
+    updateDisplay();
+
     if (dealtCards >= totalCards && totalCards > 0) {
         stopDealing();
         showStatusMessage("All Done!");
@@ -740,7 +743,7 @@ void processInfraredInput() {
             irValue == IR2_REMAIN_CARDS ||
 #endif
             false) {
-            remainCards += playerCount;
+            remainCards += 1;   // 每次增加1，而非playerCount
             if (remainCards > playerCount * 4) remainCards = 0;
             totalCards = deckCount * (hasJokers ? 54 : 52);
             if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
@@ -944,7 +947,7 @@ void handleSerialCommand(const char* command) {
             updateDisplay();
             break;
         case 'r': case 'R':
-            remainCards += playerCount;
+            remainCards += 1;   // 每次增加1，而非playerCount
             if (remainCards > playerCount * 4) remainCards = 0;
             totalCards = deckCount * (hasJokers ? 54 : 52);
             if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
@@ -1108,7 +1111,7 @@ void updateDisplay() {
     lcd.print(F(" "));
     lcd.print(clockwise ? F("CCW") : F("CW"));
 
-    // 第二行：D:已发/总数 状态 C:计数
+    // 第二行：D:已发/总数 状态 C:计数（仅DEBUG时显示）
     lcd.setCursor(0, 1);
     lcd.print(F("D:"));
     lcd.print(dealtCards);
@@ -1126,8 +1129,10 @@ void updateDisplay() {
     } else {
         lcd.print(F("S"));
     }
+#if DEBUG
     lcd.print(F(" C:"));
     lcd.print(photoACount);
+#endif
 }
 
 void showStatusMessage(const char* message) {
