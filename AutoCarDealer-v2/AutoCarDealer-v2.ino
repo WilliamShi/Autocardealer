@@ -140,6 +140,22 @@ uint8_t scoreY = 2;   // 默认02
 // ==================== 软件复位函数指针 ====================
 void (*resetFunc)(void) = 0;  // 指向地址0，调用即复位
 
+// ==================== 上次显示的值（用于局部刷新）====================
+uint8_t lastPlayerCount = 0;
+uint8_t lastDeckCount = 0;
+uint8_t lastHasJokers = 0;
+uint8_t lastScoreX = 0;
+uint8_t lastScoreY = 0;
+bool lastClockwise = true;
+uint16_t lastDealtCards = 0;
+uint16_t lastTotalCards = 0;
+uint8_t lastIsRunning = 0;
+SystemState lastCurrentState = STATE_IDLE;
+uint16_t lastPhotoACount = 0;
+
+// ==================== 全局刷新标志 ====================
+bool fullRefresh = true;   // 初始需要全刷新
+
 // ==================== 基于16计数每圈的发牌位置表 ====================
 const uint8_t basePositions16[9][8] = {
     {0},       // 0人（未用）
@@ -314,7 +330,7 @@ void processCard() {
     Serial.println(dealtCards);
 #endif
 
-    // 每发一张牌立即更新LCD显示
+    // 每发一张牌立即更新LCD显示（局部刷新）
     updateDisplay();
 
     if (dealtCards >= totalCards && totalCards > 0) {
@@ -400,6 +416,8 @@ void calibrateMotorA() {
         lcd.print("A TO           ");
     }
     delay(800);
+    // 临时消息覆盖了第二行，需要全刷新恢复固定字符
+    fullRefresh = true;
     updateDisplay();
 }
 
@@ -412,10 +430,11 @@ void resetDealCounts() {
     if (isRunning != 0) {
         stopDealing();
     }
-    updateDisplay();
+    updateDisplay();                 // 先更新显示
     lcd.setCursor(0, 1);
-    lcd.print(F("Counts reset"));
+    lcd.print(F("Counts reset"));    // 覆盖第二行
     delay(500);
+    fullRefresh = true;               // 需要全刷新恢复固定字符
     updateDisplay();
 }
 
@@ -450,6 +469,7 @@ void pauseDealing() {
         // 等待电源稳定并重新初始化LCD
         delay(100);
         lcd.begin(16, 2);
+        fullRefresh = true;
         
 #if DEBUG
         Serial.println(F("Paused"));
@@ -478,8 +498,10 @@ void resumeDealing() {
         }
         isRunning = 1;
         
-        // 重新初始化LCD（可选）
+        // 延迟后重新初始化LCD
+        delay(50);
         lcd.begin(16, 2);
+        fullRefresh = true;
         
 #if DEBUG
         Serial.println(F("Resumed"));
@@ -535,6 +557,7 @@ void stopDealing() {
     
     // 重新初始化LCD，确保其恢复正常
     lcd.begin(16, 2);
+    fullRefresh = true;
     
     updateDisplay();
 }
@@ -738,6 +761,7 @@ void processInfraredInput() {
 #endif
             false) {
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Idle"));
             delay(800);
             updateDisplay();
@@ -764,6 +788,7 @@ void processInfraredInput() {
         if (irValue == IR_TEST_MOTOR_A) {
             enableMotorDriver();
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("MotorA Test"));
             lcd.setCursor(0, 1);
             lcd.print(F("Wait count..."));
@@ -782,6 +807,7 @@ void processInfraredInput() {
             }
             if (!testComplete) stopAllMotors();
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Test done"));
             delay(800);
             updateDisplay();
@@ -792,6 +818,7 @@ void processInfraredInput() {
             enableMotorDriver();
             controlMotorB(true);
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("MotorB Test"));
             lcd.setCursor(0, 1);
             lcd.print(F("Wait card..."));
@@ -810,6 +837,7 @@ void processInfraredInput() {
                 }
                 controlMotorB(false);
                 lcd.clear();
+                fullRefresh = true;
                 if (cardDetected) lcd.print(F("B OK"));
                 else lcd.print(F("B TO"));
             }
@@ -834,6 +862,7 @@ void processInfraredInput() {
             clockwise = !clockwise;
             resetDealCounts();
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Direction:"));
             lcd.setCursor(0, 1);
             lcd.print(clockwise ? F("CCW") : F("CW"));
@@ -861,6 +890,7 @@ void processInfraredInput() {
 #if ENABLE_INFRA
         if (irValue == IR_VERSION) {
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Dealer v40.4"));
             lcd.setCursor(0, 1);
             lcd.print(F("16-edge mode"));
@@ -924,6 +954,7 @@ void handleSerialCommand(const char* command) {
 #if ENABLE_KEYBOARD
     if (command[0] >= '0' && command[0] <= '9') {
         lcd.clear();
+        fullRefresh = true;
         lcd.print(F("Not supported"));
         delay(800);
         updateDisplay();
@@ -932,6 +963,7 @@ void handleSerialCommand(const char* command) {
     switch (command[0]) {
         case 'v': case 'V':
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Dealer v40.4"));
             lcd.setCursor(0, 1);
             lcd.print(F("16-edge mode"));
@@ -980,6 +1012,7 @@ void handleSerialCommand(const char* command) {
             if (!isRunning) {
                 enableMotorDriver();
                 lcd.clear();
+                fullRefresh = true;
                 lcd.print(F("MotorA Test"));
                 lcd.setCursor(0, 1);
                 lcd.print(F("Wait count..."));
@@ -998,6 +1031,7 @@ void handleSerialCommand(const char* command) {
                 }
                 if (!testComplete) stopAllMotors();
                 lcd.clear();
+                fullRefresh = true;
                 lcd.print(F("Test done"));
                 delay(800);
                 updateDisplay();
@@ -1008,6 +1042,7 @@ void handleSerialCommand(const char* command) {
                 enableMotorDriver();
                 controlMotorB(true);
                 lcd.clear();
+                fullRefresh = true;
                 lcd.print(F("MotorB Test"));
                 lcd.setCursor(0, 1);
                 lcd.print(F("Wait card..."));
@@ -1025,6 +1060,7 @@ void handleSerialCommand(const char* command) {
                 }
                 controlMotorB(false);
                 lcd.clear();
+                fullRefresh = true;
                 if (cardDetected) lcd.print(F("B OK"));
                 else lcd.print(F("B TO"));
                 delay(800);
@@ -1035,6 +1071,7 @@ void handleSerialCommand(const char* command) {
             clockwise = !clockwise;
             resetDealCounts();
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("Direction:"));
             lcd.setCursor(0, 1);
             lcd.print(clockwise ? F("CCW") : F("CW"));
@@ -1051,6 +1088,7 @@ void handleSerialCommand(const char* command) {
             break;
         case '+': case '-':
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("No circle adj"));
             delay(800);
             updateDisplay();
@@ -1065,6 +1103,7 @@ void handleSerialCommand(const char* command) {
             break;
         default:
             lcd.clear();
+            fullRefresh = true;
             lcd.print(F("?"));
             delay(800);
             updateDisplay();
@@ -1091,6 +1130,7 @@ void resetSystem() {
     
     // 重新初始化LCD
     lcd.begin(16, 2);
+    fullRefresh = true;
     lcd.clear();
     lcd.print(F("Reset"));
     lcd.setCursor(0, 1);
@@ -1099,53 +1139,143 @@ void resetSystem() {
     updateDisplay();
 }
 
-// ==================== LCD 显示 ====================
+// ==================== LCD 显示（局部刷新）====================
 void updateDisplay() {
-    lcd.clear();
-    // 第一行：Px Dx J 比分 方向
-    lcd.setCursor(0, 0);
-    lcd.print(F("P"));
-    lcd.print(playerCount);
-    lcd.print(F(" D"));
-    lcd.print(deckCount);
-    lcd.print(F(" "));
-    lcd.print(hasJokers ? F("J") : F("N"));
-    lcd.print(F(" "));
-    // 显示比分，两位数字带前导零
-    if (scoreX < 10) lcd.print('0');
-    lcd.print(scoreX);
-    lcd.print(':');
-    if (scoreY < 10) lcd.print('0');
-    lcd.print(scoreY);
-    lcd.print(F(" "));
-    lcd.print(clockwise ? F("CCW") : F("CW"));
+    if (fullRefresh) {
+        // 全刷新：清屏并打印所有固定字符及当前值
+        lcd.clear();
 
-    // 第二行：D:已发/总数 状态 C:计数（仅DEBUG时显示）
-    lcd.setCursor(0, 1);
-    lcd.print(F("D:"));
-    lcd.print(dealtCards);
-    lcd.print(F("/"));
-    lcd.print(totalCards);
-    lcd.print(F(" "));
-    if (isRunning == 1) {
-        switch (currentState) {
-            case STATE_B_RUNNING: lcd.print(F("B")); break;
-            case STATE_A_RUNNING: lcd.print(F("A")); break;
-            default: lcd.print(F("R"));
+        // ---- 第一行固定字符 ----
+        lcd.setCursor(0, 0); lcd.print('P');
+        lcd.setCursor(2, 0); lcd.print(' ');
+        lcd.setCursor(3, 0); lcd.print('D');
+        lcd.setCursor(5, 0); lcd.print(' ');
+        lcd.setCursor(7, 0); lcd.print(' ');
+        lcd.setCursor(10,0); lcd.print(':');
+        lcd.setCursor(13,0); lcd.print(' ');
+
+        // ---- 第二行固定字符 ----
+        lcd.setCursor(0, 1); lcd.print('D');
+        lcd.setCursor(1, 1); lcd.print(':');
+        lcd.setCursor(5, 1); lcd.print('/');
+        lcd.setCursor(9, 1); lcd.print(' ');
+
+        // 更新所有变量
+        lcd.setCursor(1, 0); lcd.print(playerCount);
+        lcd.setCursor(4, 0); lcd.print(deckCount);
+        lcd.setCursor(6, 0); lcd.print(hasJokers ? 'J' : 'N');
+        lcd.setCursor(8, 0); if (scoreX < 10) lcd.print('0'); lcd.print(scoreX);
+        lcd.setCursor(11,0); if (scoreY < 10) lcd.print('0'); lcd.print(scoreY);
+        lcd.setCursor(14,0);
+        if (clockwise) lcd.print("CCW");
+        else lcd.print("CW ");
+
+        char buf[4];
+        lcd.setCursor(2, 1); sprintf(buf, "%-3d", dealtCards); lcd.print(buf);
+        lcd.setCursor(6, 1); sprintf(buf, "%-3d", totalCards); lcd.print(buf);
+
+        uint8_t stateChar;
+        if (isRunning == 1) {
+            switch (currentState) {
+                case STATE_B_RUNNING: stateChar = 'B'; break;
+                case STATE_A_RUNNING: stateChar = 'A'; break;
+                default: stateChar = 'R';
+            }
+        } else if (isRunning == 2) {
+            stateChar = 'P';
+        } else {
+            stateChar = 'S';
         }
-    } else if (isRunning == 2) {
-        lcd.print(F("P"));
-    } else {
-        lcd.print(F("S"));
-    }
+        lcd.setCursor(10, 1); lcd.print(stateChar);
+
 #if DEBUG
-    lcd.print(F(" C:"));
-    lcd.print(photoACount);
+        lcd.setCursor(14, 1); sprintf(buf, "%-3d", photoACount); lcd.print(buf);
 #endif
+
+        // 更新所有 last_* 变量
+        lastPlayerCount = playerCount;
+        lastDeckCount = deckCount;
+        lastHasJokers = hasJokers;
+        lastScoreX = scoreX;
+        lastScoreY = scoreY;
+        lastClockwise = clockwise;
+        lastDealtCards = dealtCards;
+        lastTotalCards = totalCards;
+        lastIsRunning = isRunning;
+        lastCurrentState = currentState;
+        lastPhotoACount = photoACount;
+
+        fullRefresh = false;
+    } else {
+        // 局部刷新：只更新变化的部分
+        if (playerCount != lastPlayerCount) {
+            lcd.setCursor(1, 0); lcd.print(playerCount);
+            lastPlayerCount = playerCount;
+        }
+        if (deckCount != lastDeckCount) {
+            lcd.setCursor(4, 0); lcd.print(deckCount);
+            lastDeckCount = deckCount;
+        }
+        if (hasJokers != lastHasJokers) {
+            lcd.setCursor(6, 0); lcd.print(hasJokers ? 'J' : 'N');
+            lastHasJokers = hasJokers;
+        }
+        if (scoreX != lastScoreX) {
+            lcd.setCursor(8, 0); if (scoreX < 10) lcd.print('0'); lcd.print(scoreX);
+            lastScoreX = scoreX;
+        }
+        if (scoreY != lastScoreY) {
+            lcd.setCursor(11,0); if (scoreY < 10) lcd.print('0'); lcd.print(scoreY);
+            lastScoreY = scoreY;
+        }
+        if (clockwise != lastClockwise) {
+            lcd.setCursor(14,0);
+            if (clockwise) lcd.print("CCW");
+            else lcd.print("CW ");
+            lastClockwise = clockwise;
+        }
+
+        char buf[4];
+        if (dealtCards != lastDealtCards) {
+            lcd.setCursor(2, 1); sprintf(buf, "%-3d", dealtCards); lcd.print(buf);
+            lastDealtCards = dealtCards;
+        }
+        if (totalCards != lastTotalCards) {
+            lcd.setCursor(6, 1); sprintf(buf, "%-3d", totalCards); lcd.print(buf);
+            lastTotalCards = totalCards;
+        }
+
+        uint8_t stateChar;
+        if (isRunning == 1) {
+            switch (currentState) {
+                case STATE_B_RUNNING: stateChar = 'B'; break;
+                case STATE_A_RUNNING: stateChar = 'A'; break;
+                default: stateChar = 'R';
+            }
+        } else if (isRunning == 2) {
+            stateChar = 'P';
+        } else {
+            stateChar = 'S';
+        }
+        if (isRunning != lastIsRunning || currentState != lastCurrentState) {
+            lcd.setCursor(10, 1); lcd.print(stateChar);
+            lastIsRunning = isRunning;
+            lastCurrentState = currentState;
+        }
+
+#if DEBUG
+        if (photoACount != lastPhotoACount) {
+            lcd.setCursor(14, 1); sprintf(buf, "%-3d", photoACount); lcd.print(buf);
+            lastPhotoACount = photoACount;
+        }
+#endif
+    }
 }
 
+// ==================== 显示临时消息（全屏清除后显示，然后恢复）====================
 void showStatusMessage(const char* message) {
     lcd.clear();
+    fullRefresh = true;          // 之后需要全刷新恢复主界面
     lcd.print(message);
     lcd.setCursor(0, 1);
     lcd.print(F("D:"));
@@ -1153,6 +1283,7 @@ void showStatusMessage(const char* message) {
     lcd.print(F("/"));
     lcd.print(totalCards);
     delay(400);
+    updateDisplay(); // 恢复主界面
 }
 
 // ==================== SETUP ====================
@@ -1194,8 +1325,22 @@ void setup() {
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
 
+    // 初始化上次显示值，确保第一次 updateDisplay() 全刷新
+    lastPlayerCount = 0;
+    lastDeckCount = 0;
+    lastHasJokers = 0;
+    lastScoreX = 0;
+    lastScoreY = 0;
+    lastClockwise = !clockwise;
+    lastDealtCards = 0xFFFF;
+    lastTotalCards = 0;
+    lastIsRunning = 0xFF;
+    lastCurrentState = (SystemState)0xFF;
+    lastPhotoACount = 0xFFFF;
+
     performInitialHoming();
 
+    fullRefresh = true;   // 归位后需要全刷新
     updateDisplay();
 
 #if DEBUG
