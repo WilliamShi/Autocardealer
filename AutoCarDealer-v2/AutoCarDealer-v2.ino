@@ -321,7 +321,7 @@ void updatePhotoB() {
 
 // ==================== 处理一张牌发出（优化：电机B不停止）====================
 void processCard() {
-    cardIgnoreUntil = millis() + 300;  // 消隐窗口300ms
+    cardIgnoreUntil = millis() + 50;  // 消隐窗口300ms
     dealtCards++;
     lastCardTime = millis();
 
