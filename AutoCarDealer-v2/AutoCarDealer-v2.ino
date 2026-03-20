@@ -68,6 +68,10 @@
 #define PHOTO_A_PIN A4        // 电机A计数光电开关
 #define PHOTO_B_PIN A0        // 电机B发牌检测光电开关
 
+// ==================== LED 引脚定义 ====================
+#define LED_RED_PIN 13    // 红色LED控制引脚（D13）
+#define LED_GREEN_PIN A5  // 绿色LED控制引脚（A5作为数字引脚使用）
+
 // ==================== 模块实例化 ====================
 LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
 
@@ -194,6 +198,54 @@ void handleSerialCommand(const char* command);
 void updateDisplay();
 void showStatusMessage(const char* message);
 void updateNextStopCount();
+void setLED(uint8_t red, uint8_t green);
+void blinkLEDBoth(int duration);
+void updateLEDState();
+
+// ==================== LED 控制函数 ====================
+void setLED(uint8_t red, uint8_t green) {
+    digitalWrite(LED_RED_PIN, red ? HIGH : LOW);
+    digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
+}
+
+void blinkLEDBoth(int duration) {
+    unsigned long start = millis();
+    unsigned long lastBlink = 0;
+    bool redOn = true;
+    
+    while (millis() - start < duration) {
+        if (millis() - lastBlink > 100) {
+            lastBlink = millis();
+            redOn = !redOn;
+            setLED(redOn ? 1 : 0, redOn ? 0 : 1);
+        }
+        // 在闪烁期间继续处理其他任务
+        processSerialInput();
+        #if ENABLE_INFRA || ENABLE_INFRA2
+        // 注意：这里不处理红外，避免递归
+        #endif
+        if (isRunning == 1) {
+            // 在闪烁期间也保持电机状态检测
+            handleMotorState();
+        }
+        delay(10);
+    }
+    // 闪烁结束后恢复到当前状态
+    updateLEDState();
+}
+
+void updateLEDState() {
+    if (isRunning == 0) {
+        // 停止状态：红色
+        setLED(1, 0);
+    } else if (isRunning == 1) {
+        // 运行状态：绿色
+        setLED(0, 1);
+    } else if (isRunning == 2) {
+        // 暂停状态：红色+绿色（黄色）
+        setLED(1, 1);
+    }
+}
 
 // ==================== 电机控制函数（优化快速停止）====================
 void enableMotorDriver() {
@@ -475,6 +527,7 @@ void pauseDealing() {
         Serial.println(F("Paused"));
 #endif
         updateDisplay();
+        updateLEDState();  // 更新LED为暂停状态（红+绿）
     }
 }
 
@@ -507,6 +560,7 @@ void resumeDealing() {
         Serial.println(F("Resumed"));
 #endif
         updateDisplay();
+        updateLEDState();  // 更新LED为运行状态（绿）
     }
 }
 
@@ -535,6 +589,7 @@ void startDealing() {
         showStatusMessage("Start");
         delay(300);
         updateDisplay();
+        updateLEDState();  // 更新LED为运行状态（绿）
     } else if (isRunning == 1) {
         pauseDealing();
     } else if (isRunning == 2) {
@@ -560,6 +615,7 @@ void stopDealing() {
     fullRefresh = true;
     
     updateDisplay();
+    updateLEDState();  // 更新LED为停止状态（红）
 }
 
 // ==================== 状态机处理（电机B常转）====================
@@ -639,6 +695,10 @@ void processInfraredInput() {
             IrReceiver.resume();
             return;
         }
+        
+        // 收到有效红外信号，红绿闪烁1秒
+        blinkLEDBoth(1000);
+        
         lastIRCommandTime = now;
         lastIRCommandValue = irValue;
 
@@ -1137,6 +1197,7 @@ void resetSystem() {
     lcd.print(F("Homing"));
     delay(800);
     updateDisplay();
+    setLED(1, 0);  // 复位后红色
 }
 
 // ==================== LCD 显示（局部刷新）====================
@@ -1298,6 +1359,8 @@ void setup() {
     pinMode(MOTOR_STBY, OUTPUT);
     pinMode(PHOTO_A_PIN, INPUT_PULLUP);
     pinMode(PHOTO_B_PIN, INPUT_PULLUP);
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
     disableMotorDriver();
 
     lcd.begin(16, 2);
@@ -1305,6 +1368,8 @@ void setup() {
     lcd.print(F("Dealer v40.4"));
     lcd.setCursor(0, 1);
     lcd.print(F("Homing"));
+
+    setLED(1, 0);  // 上电红色
 
 #if DEBUG
     Serial.begin(9600);
