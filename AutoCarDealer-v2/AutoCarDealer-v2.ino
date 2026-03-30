@@ -8,7 +8,7 @@
 // ==================== 优化参数配置 ====================
 // 电机速度（已经是最大255）
 #define MOTOR_A_SPEED 255
-#define MOTOR_B_SPEED 255
+#define MOTOR_B_SPEED 180
 
 // 超时时间（进一步减少以加快错误恢复）
 #define MOTOR_B_TIMEOUT 8000       // 从4000ms减少到3000ms
@@ -80,8 +80,8 @@
 #define MOTOR_A_IN1 6
 #define MOTOR_A_IN2 7
 #define MOTOR_A_PWM 9
-#define MOTOR_B_IN1 A2
-#define MOTOR_B_IN2 A3
+#define MOTOR_B_IN1 A3
+#define MOTOR_B_IN2 A2
 #define MOTOR_B_PWM 10
 #define MOTOR_STBY 8
 
@@ -385,8 +385,10 @@ void updatePhotoB() {
     lastPhotoBState = currentStateB;
 }
 
-// ==================== 处理一张牌发出（优化：电机B不停止）====================
+// ==================== 处理一张牌发出（恢复原流程：电机B停止，发牌后停止B，启动A）====================
 void processCard() {
+    // 停止电机B
+    controlMotorB(false);
     cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
     dealtCards++;
     lastCardTime = millis();
@@ -407,15 +409,18 @@ void processCard() {
         return;
     }
 
-    // 电机B保持转动，不停止
+    // 计算下一次停止计数
     updateNextStopCount();
 
-    // 如果需要旋转，启动电机A（电机B继续转）
+    // 如果需要旋转，启动电机A（电机B已停止）
     if (nextStopCount > photoACount) {
         controlMotorA(true);
         currentState = STATE_A_RUNNING;
+        motorAStartTime = millis();
+        lastPhotoATime = millis();
     } else {
-        // 不需要旋转，电机B继续转，状态保持B_RUNNING
+        // 不需要旋转，重新启动电机B继续发牌
+        controlMotorB(true);
         currentState = STATE_B_RUNNING;
     }
 }
@@ -560,15 +565,12 @@ void resumeDealing() {
         if (currentState == STATE_A_RUNNING) {
             motorAStartTime = millis();        // 电机A超时计时
             lastPhotoATime = millis();          // 电机A停滞检测计时
+            controlMotorA(true);
+        } else if (currentState == STATE_B_RUNNING) {
+            controlMotorB(true);
         }
         cardIgnoreUntil = 0;                    // 清除消隐窗口，确保光电B立即生效
         
-        // 恢复时先启动电机B（常转）
-        controlMotorB(true);
-        if (currentState == STATE_A_RUNNING) {
-            // 如果之前是在旋转状态，也要启动电机A
-            controlMotorA(true);
-        }
         isRunning = 1;
         
         // 延迟后重新初始化LCD
@@ -602,7 +604,7 @@ void startDealing() {
         stopAllMotors();
         enableMotorDriver();
 
-        // 启动电机B并保持运转
+        // 启动电机B开始发牌
         controlMotorB(true);
         lastCardTime = millis();
         currentState = STATE_B_RUNNING;
@@ -638,20 +640,18 @@ void stopDealing() {
     updateLEDState();  // 更新LED为停止状态（红）- 直接更新，不闪烁
 }
 
-// ==================== 状态机处理（电机B常转）====================
+// ==================== 状态机处理（恢复原流程：B运行->出牌->停止B->启动A->A到位->启动B）====================
 void handleMotorState() {
-    // 电机B超时检测（基于最后出牌时间）
-    if (isRunning == 1 && (millis() - lastCardTime > motorBTimeout)) {
-        pauseDealing();
-        showStatusMessage("B Timeout");
-        delay(150);  // 进一步减少延迟
-        updateDisplay();
-        return;
-    }
-
     switch (currentState) {
         case STATE_B_RUNNING:
             updatePhotoB();  // 检测出牌
+            // 电机B超时检测（基于最后出牌时间）
+            if (millis() - lastCardTime > motorBTimeout) {
+                pauseDealing();
+                showStatusMessage("B Timeout");
+                delay(150);
+                updateDisplay();
+            }
             break;
 
         case STATE_A_RUNNING:
@@ -661,8 +661,10 @@ void handleMotorState() {
             if (photoACount >= nextStopCount) {
                 controlMotorA(false);  // 停止电机A
                 if (dealtCards < totalCards) {
-                    // 电机B继续转，状态切回B_RUNNING
+                    // 旋转到位，重新启动电机B继续发牌
+                    controlMotorB(true);
                     currentState = STATE_B_RUNNING;
+                    lastCardTime = millis();   // 重置B超时计时
                 } else {
                     stopDealing();  // 发完牌停止
                 }
@@ -673,7 +675,7 @@ void handleMotorState() {
                 controlMotorA(false);
                 pauseDealing();
                 showStatusMessage("A Stuck");
-                delay(150);  // 进一步减少延迟
+                delay(150);
                 updateDisplay();
             }
 
@@ -682,7 +684,7 @@ void handleMotorState() {
                 controlMotorA(false);
                 pauseDealing();
                 showStatusMessage("A Timeout");
-                delay(150);  // 进一步减少延迟
+                delay(150);
                 updateDisplay();
             }
             break;
