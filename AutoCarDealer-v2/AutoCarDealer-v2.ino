@@ -8,7 +8,7 @@
 // ==================== 优化参数配置 ====================
 // 电机速度（已经是最大255）
 #define MOTOR_A_SPEED 255
-#define MOTOR_B_SPEED 180
+#define MOTOR_B_SPEED 255
 
 // 超时时间（进一步减少以加快错误恢复）
 #define MOTOR_B_TIMEOUT 8000       // 从4000ms减少到3000ms
@@ -57,13 +57,13 @@
 
 // ==================== 第二个红外遥控器按键定义 ====================
 #if ENABLE_INFRA2
-#define IR2_START        0xFE017F80 //发牌，暂停，恢复，等同于IR_START
-#define IR2_STOP         0xED127F80 //停止发牌，等同于 IR_STOP
-#define IR2_INC_PLAYER   0xFA057F80 //等同于IR_INC_PLAYER
-#define IR2_REMAIN_CARDS 0xE41B7F80 //等同于IR_REMAIN_CARDS
-#define IR2_INC_DECK     0xEE117F80 //等同于IR_INC_DECK
-#define IR2_TOGGLE_JOKER 0xFC037F80 //等同于IR_TOGGLE_JOKER
-#define IR2_TOGGLE_MODE  0xF6097F80 //等同于IR_TOGGLE_MODE
+#define IR2_START        0xFE017F80 //play,发牌，暂停，恢复，等同于IR_START
+#define IR2_STOP         0xED127F80 //up,停止发牌，等同于 IR_STOP
+#define IR2_INC_PLAYER   0xFA057F80 //+等同于IR_INC_PLAYER
+#define IR2_REMAIN_CARDS 0xE41B7F80 //-等同于IR_REMAIN_CARDS
+#define IR2_INC_DECK     0xEE117F80 //left等同于IR_INC_DECK
+#define IR2_TOGGLE_JOKER 0xFC037F80 //right等同于IR_TOGGLE_JOKER
+#define IR2_TOGGLE_MODE  0xF6097F80 //down等同于IR_TOGGLE_MODE
 #endif
 
 // ==================== 库包含 ====================
@@ -292,7 +292,7 @@ void updateLEDState() {
 // ==================== 电机控制函数（优化快速停止）====================
 void enableMotorDriver() {
     digitalWrite(MOTOR_STBY, HIGH);
-    delay(2);  // 进一步减少延迟
+    delayMicroseconds(100);  // 进一步减少延迟从delay(2)改到目前这样
 }
 
 void disableMotorDriver() {
@@ -404,7 +404,7 @@ void processCard() {
     if (dealtCards >= totalCards && totalCards > 0) {
         stopDealing();
         showStatusMessage("All Done!");
-        delay(150);  // 进一步减少延迟
+        delayMicroseconds(150);  // 进一步减少延迟从delay(150)改到目前值
         updateDisplay();
         return;
     }
