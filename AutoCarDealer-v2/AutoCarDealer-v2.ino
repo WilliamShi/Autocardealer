@@ -15,14 +15,14 @@
 #define MOTOR_A_TIMEOUT 1500       // 从2000ms减少到1500ms
 
 // 消隐窗口（进一步减少以提高发牌频率）
-#define CARD_IGNORE_TIME 80        // 从150ms减少到80ms
+#define CARD_IGNORE_TIME 20        // 从150ms减少到80ms
 
 // 防抖时间（进一步减少以提高响应速度）
 #define PHOTO_A_DEBOUNCE 3         // 从5ms减少到3ms
-#define PHOTO_B_DEBOUNCE 10        // 从25ms减少到10ms
+#define PHOTO_B_DEBOUNCE 3        // 从25ms减少到10ms
 
 // 循环延迟（进一步减少以提高响应速度）
-#define LOOP_DELAY 2               // 从5ms减少到2ms
+#define LOOP_DELAY 0               // 从5ms减少到2ms
 
 // 红外防抖（进一步减少）
 #define IR_DEBOUNCE_TIME 150       // 从200ms减少到150ms
@@ -235,7 +235,7 @@ void initPositionCache() {
         cacheInitialized = true;
         return;
     }
-    
+
     for (int i = 0; i < 256; i++) {
         uint8_t circle = i / playerCount;
         uint8_t posInCircle = i % playerCount;
@@ -254,7 +254,7 @@ void blinkLEDBoth(int duration) {
     unsigned long start = millis();
     unsigned long lastBlink = 0;
     bool redOn = true;
-    
+
     while (millis() - start < duration) {
         if (millis() - lastBlink > 20) {
             lastBlink = millis();
@@ -384,47 +384,89 @@ void updatePhotoB() {
 
     lastPhotoBState = currentStateB;
 }
-
+void updateDealtFast() {
+    uint8_t h = dealtCards / 100;
+    uint8_t t = (dealtCards / 10) % 10;
+    uint8_t o = dealtCards % 10;
+    lcd.setCursor(2, 1);
+    lcd.write('0' + h);
+    lcd.write('0' + t);
+    lcd.write('0' + o);
+}
 // ==================== 处理一张牌发出（恢复原流程：电机B停止，发牌后停止B，启动A）====================
+//void processCard() {
+//    // 停止电机B
+//    controlMotorB(false);
+//    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
+//    dealtCards++;
+//    lastCardTime = millis();
+//
+//#if DEBUG
+//    Serial.print(F("Card dealt: "));
+//    Serial.println(dealtCards);
+//#endif
+//
+//    // 每发一张牌立即更新LCD显示（局部刷新）
+//    updateDisplay();
+//
+//    if (dealtCards >= totalCards && totalCards > 0) {
+//        stopDealing();
+//        showStatusMessage("All Done!");
+//        delayMicroseconds(150);  // 进一步减少延迟从delay(150)改到目前值
+//        updateDisplay();
+//        return;
+//    }
+//
+//    // 计算下一次停止计数
+//    updateNextStopCount();
+//
+//    // 如果需要旋转，启动电机A（电机B已停止）
+//    if (nextStopCount > photoACount) {
+//        controlMotorA(true);
+//        currentState = STATE_A_RUNNING;
+//        motorAStartTime = millis();
+//        lastPhotoATime = millis();
+//    } else {
+//        // 不需要旋转，重新启动电机B继续发牌
+//        controlMotorB(true);
+//        currentState = STATE_B_RUNNING;
+//    }
+//}
 void processCard() {
-    // 停止电机B
+    // 1. 先停B，记录时间
     controlMotorB(false);
-    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
+    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
     dealtCards++;
     lastCardTime = millis();
 
-#if DEBUG
-    Serial.print(F("Card dealt: "));
-    Serial.println(dealtCards);
-#endif
-
-    // 每发一张牌立即更新LCD显示（局部刷新）
-    updateDisplay();
-
+    // 2. 完成判断
     if (dealtCards >= totalCards && totalCards > 0) {
         stopDealing();
         showStatusMessage("All Done!");
-        delayMicroseconds(150);  // 进一步减少延迟从delay(150)改到目前值
+        delayMicroseconds(150);
         updateDisplay();
         return;
     }
 
-    // 计算下一次停止计数
+    // 3. 先算下一目标，立即决定是否启动A
     updateNextStopCount();
 
-    // 如果需要旋转，启动电机A（电机B已停止）
     if (nextStopCount > photoACount) {
         controlMotorA(true);
         currentState = STATE_A_RUNNING;
         motorAStartTime = millis();
         lastPhotoATime = millis();
     } else {
-        // 不需要旋转，重新启动电机B继续发牌
         controlMotorB(true);
         currentState = STATE_B_RUNNING;
     }
-}
 
+    // 4. 显示放到运动启动之后，并且节流
+    if ((dealtCards & 0x03) == 0) {   // 每4张刷新一次
+        //updateDisplay();
+        updateDealtFast();
+    }
+}
 // ==================== 上电归位 ====================
 void performInitialHoming() {
     enableMotorDriver();
@@ -512,12 +554,12 @@ void resetDealCounts() {
 // ==================== 计算下一次停止计数 ====================
 void updateNextStopCount() {
     if (playerCount < 2 || playerCount > 8) return;
-    
+
     // 如果缓存未初始化或playerCount可能变化，确保缓存有效
     if (!cacheInitialized) {
         initPositionCache();
     }
-    
+
     // 使用缓存提高速度
     if (dealtCards < 256) {
         nextStopCount = nextStopCache[dealtCards];
@@ -542,12 +584,12 @@ void pauseDealing() {
     if (isRunning == 1) {
         stopAllMotors();
         isRunning = 2;
-        
+
         // 等待电源稳定并重新初始化LCD
         delay(30);  // 进一步减少延迟
         lcd.begin(16, 2);
         fullRefresh = true;
-        
+
 #if DEBUG
         Serial.println(F("Paused"));
 #endif
@@ -559,7 +601,7 @@ void pauseDealing() {
 void resumeDealing() {
     if (isRunning == 2) {
         enableMotorDriver();
-        
+
         // 重置所有与超时相关的计时器，防止恢复后立即再次超时
         lastCardTime = millis();               // 电机B超时计时
         if (currentState == STATE_A_RUNNING) {
@@ -570,14 +612,14 @@ void resumeDealing() {
             controlMotorB(true);
         }
         cardIgnoreUntil = 0;                    // 清除消隐窗口，确保光电B立即生效
-        
+
         isRunning = 1;
-        
+
         // 延迟后重新初始化LCD
         delay(20);  // 进一步减少延迟
         lcd.begin(16, 2);
         fullRefresh = true;
-        
+
 #if DEBUG
         Serial.println(F("Resumed"));
 #endif
@@ -628,14 +670,14 @@ void stopDealing() {
     dealtCards = 0;
     cardIgnoreUntil = 0;
     stopAllMotors();
-    
+
     // 等待电源稳定
     delay(30);  // 进一步减少延迟
-    
+
     // 重新初始化LCD，确保其恢复正常
     lcd.begin(16, 2);
     fullRefresh = true;
-    
+
     updateDisplay();
     updateLEDState();  // 更新LED为停止状态（红）- 直接更新，不闪烁
 }
@@ -717,10 +759,10 @@ void processInfraredInput() {
             IrReceiver.resume();
             return;
         }
-        
+
         // 收到有效红外信号，红绿闪烁1秒（只保留红外接收时的LED闪烁）
         blinkLEDBoth(200);
-        
+
         lastIRCommandTime = now;
         lastIRCommandValue = irValue;
 
@@ -1214,7 +1256,7 @@ void resetSystem() {
     cardIgnoreUntil = 0;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
-    
+
     // 重新初始化LCD
     lcd.begin(16, 2);
     fullRefresh = true;
@@ -1223,9 +1265,9 @@ void resetSystem() {
     lcd.setCursor(0, 1);
     lcd.print(F("Homing"));
     delay(300);
-    
+
     initPositionCache();  // 重置缓存
-    
+
     updateDisplay();
     setLED(1, 0);  // 复位后红色
 }
