@@ -485,10 +485,10 @@ void processCard() {
     }
 
     // 4. 显示放到运动启动之后，并且节流
-    if ((dealtCards & 0x03) == 0) {   // 每4张刷新一次
-        //updateDisplay();
-        updateDealtFast();
-    }
+    //if ((dealtCards & 0x03) == 0) {   // 每4张刷新一次
+    //    //updateDisplay();
+    updateDealtFast();
+    //}
 }
 // ==================== 上电归位 ====================
 void performInitialHoming() {
