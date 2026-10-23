@@ -384,15 +384,38 @@ void updatePhotoB() {
 
     lastPhotoBState = currentStateB;
 }
+// 轻量刷新已发牌数，格式与 updateDisplay() 的 "%-3d" 一致
 void updateDealtFast() {
     uint8_t h = dealtCards / 100;
     uint8_t t = (dealtCards / 10) % 10;
     uint8_t o = dealtCards % 10;
+
     lcd.setCursor(2, 1);
-    lcd.write('0' + h);
-    lcd.write('0' + t);
-    lcd.write('0' + o);
+    if (h > 0) {
+        lcd.write('0' + h);
+        lcd.write('0' + t);
+        lcd.write('0' + o);
+    } else if (t > 0) {
+        lcd.write('0' + t);
+        lcd.write('0' + o);
+        lcd.write(' ');
+    } else {
+        lcd.write('0' + o);
+        lcd.write(' ');
+        lcd.write(' ');
+    }
+
+    lastDealtCards = dealtCards;   // 同步 last 变量，避免下次 updateDisplay 重复刷
 }
+//void updateDealtFast() {
+//    uint8_t h = dealtCards / 100;
+//    uint8_t t = (dealtCards / 10) % 10;
+//    uint8_t o = dealtCards % 10;
+//    lcd.setCursor(2, 1);
+//    lcd.write('0' + h);
+//    lcd.write('0' + t);
+//    lcd.write('0' + o);
+//}
 // ==================== 处理一张牌发出（恢复原流程：电机B停止，发牌后停止B，启动A）====================
 //void processCard() {
 //    // 停止电机B
