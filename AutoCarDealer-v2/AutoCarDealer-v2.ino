@@ -15,11 +15,11 @@
 #define MOTOR_A_TIMEOUT 1500       // 从2000ms减少到1500ms
 
 // 消隐窗口（进一步减少以提高发牌频率）
-#define CARD_IGNORE_TIME 20        // 从150ms减少到80ms
+#define CARD_IGNORE_TIME 40        // 从150ms减少到80ms
 
 // 防抖时间（进一步减少以提高响应速度）
 #define PHOTO_A_DEBOUNCE 3         // 从5ms减少到3ms
-#define PHOTO_B_DEBOUNCE 3        // 从25ms减少到10ms
+#define PHOTO_B_DEBOUNCE 5        // 从25ms减少到10ms
 
 // 循环延迟（进一步减少以提高响应速度）
 #define LOOP_DELAY 0               // 从5ms减少到2ms
@@ -224,6 +224,8 @@ void updateNextStopCount();
 void setLED(uint8_t red, uint8_t green);
 void blinkLEDBoth(int duration);
 void updateLEDState();
+void updateDealtFast();
+void updateStateFast();
 
 // ==================== 初始化位置缓存 ====================
 void initPositionCache() {
@@ -366,22 +368,41 @@ void updatePhotoA() {
 }
 
 // ==================== 光电开关B检测（简化版，移除脉冲宽度检测）====================
+//void updatePhotoB() {
+//    if (isRunning != 1 || currentState != STATE_B_RUNNING) return;
+//    if (millis() < cardIgnoreUntil) return;
+//
+//    uint8_t currentStateB = digitalRead(PHOTO_B_PIN);
+//    unsigned long now = millis();
+//
+//    // 检测下降沿（遮挡开始）
+//    if (currentStateB == LOW && lastPhotoBState == HIGH) {
+//        if (now - photoBDebounce > PHOTO_B_DEBOUNCE) {
+//            photoBDebounce = now;
+//            // 直接处理发牌，不再等待上升沿
+//            processCard();
+//        }
+//    }
+//
+//    lastPhotoBState = currentStateB;
+//}
 void updatePhotoB() {
     if (isRunning != 1 || currentState != STATE_B_RUNNING) return;
-    if (millis() < cardIgnoreUntil) return;
 
     uint8_t currentStateB = digitalRead(PHOTO_B_PIN);
     unsigned long now = millis();
 
-    // 检测下降沿（遮挡开始）
-    if (currentStateB == LOW && lastPhotoBState == HIGH) {
-        if (now - photoBDebounce > PHOTO_B_DEBOUNCE) {
-            photoBDebounce = now;
-            // 直接处理发牌，不再等待上升沿
-            processCard();
+    // 消隐窗口外才计数，但窗口内仍然跟踪 lastPhotoBState
+    if (now >= cardIgnoreUntil) {
+        if (currentStateB == LOW && lastPhotoBState == HIGH) {
+            if (now - photoBDebounce > PHOTO_B_DEBOUNCE) {
+                photoBDebounce = now;
+                processCard();
+            }
         }
     }
 
+    // ★ 关键：无论是否在消隐窗口，都同步最新光电状态
     lastPhotoBState = currentStateB;
 }
 // 轻量刷新已发牌数，格式与 updateDisplay() 的 "%-3d" 一致
@@ -406,6 +427,27 @@ void updateDealtFast() {
     }
 
     lastDealtCards = dealtCards;   // 同步 last 变量，避免下次 updateDisplay 重复刷
+}
+// ==================== 轻量刷新：状态字符（B/A/P/S/R）====================
+void updateStateFast() {
+    uint8_t stateChar;
+    if (isRunning == 1) {
+        switch (currentState) {
+            case STATE_B_RUNNING: stateChar = 'B'; break;
+            case STATE_A_RUNNING: stateChar = 'A'; break;
+            default:              stateChar = 'R'; break;
+        }
+    } else if (isRunning == 2) {
+        stateChar = 'P';
+    } else {
+        stateChar = 'S';
+    }
+
+    lcd.setCursor(10, 1);
+    lcd.write(stateChar);
+
+    lastIsRunning = isRunning;
+    lastCurrentState = currentState;
 }
 //void updateDealtFast() {
 //    uint8_t h = dealtCards / 100;
@@ -480,6 +522,7 @@ void processCard() {
         motorAStartTime = millis();
         lastPhotoATime = millis();
     } else {
+        lastPhotoBState = digitalRead(PHOTO_B_PIN);
         controlMotorB(true);
         currentState = STATE_B_RUNNING;
     }
@@ -488,6 +531,7 @@ void processCard() {
     //if ((dealtCards & 0x03) == 0) {   // 每4张刷新一次
     //    //updateDisplay();
     updateDealtFast();
+    updateStateFast();
     //}
 }
 // ==================== 上电归位 ====================
@@ -634,7 +678,9 @@ void resumeDealing() {
         } else if (currentState == STATE_B_RUNNING) {
             controlMotorB(true);
         }
-        cardIgnoreUntil = 0;                    // 清除消隐窗口，确保光电B立即生效
+        //cardIgnoreUntil = 0;                    // 清除消隐窗口，确保光电B立即生效
+        cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
+        lastPhotoBState = digitalRead(PHOTO_B_PIN);
 
         isRunning = 1;
 
@@ -726,10 +772,15 @@ void handleMotorState() {
             if (photoACount >= nextStopCount) {
                 controlMotorA(false);  // 停止电机A
                 if (dealtCards < totalCards) {
+                    // ★ 重新设置 B 的消隐窗口，并同步光电状态
+                    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
+                    lastPhotoBState = digitalRead(PHOTO_B_PIN);
+
                     // 旋转到位，重新启动电机B继续发牌
                     controlMotorB(true);
                     currentState = STATE_B_RUNNING;
                     lastCardTime = millis();   // 重置B超时计时
+                    updateStateFast();
                 } else {
                     stopDealing();  // 发完牌停止
                 }
