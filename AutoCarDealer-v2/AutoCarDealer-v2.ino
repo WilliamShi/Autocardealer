@@ -8,7 +8,7 @@
 // ==================== 优化参数配置 ====================
 // 电机速度（已经是最大255）
 #define MOTOR_A_SPEED 255
-#define MOTOR_B_SPEED 219
+#define MOTOR_B_SPEED 230
 
 // 超时时间（进一步减少以加快错误恢复）
 #define MOTOR_B_TIMEOUT 8000       // 从4000ms减少到3000ms
@@ -141,6 +141,14 @@ unsigned long photoBDebounce = 0;
 unsigned long lastCardTime = 0;
 unsigned long cardIgnoreUntil = 0;        // 发牌后消隐窗口结束时间
 bool waitingCardClear = false;            // 等待旧牌离开光电，防止B重启后旧牌抖动被多计
+uint8_t lastPhotoBInA = HIGH;             // A转动期间跟踪光电B状态
+bool bActivityInA = false;                // A转动期间检测到光电B活动，说明B惯性带出牌
+
+// ---- 非阻塞 LED 闪烁状态 ----
+bool blinkActive = false;
+unsigned long blinkStartMs = 0;
+unsigned long blinkDurationMs = 0;
+uint8_t blinkLastPhase = 0;
 
 // ---- 调试定时器 ----
 unsigned long lastDebugTime = 0;
@@ -203,6 +211,7 @@ void disableMotorDriver();
 void stopAllMotors();
 void controlMotorA(bool enable);
 void controlMotorB(bool enable);
+void controlMotorB_SlowStop();
 void startDealing();
 void pauseDealing();
 void resumeDealing();
@@ -225,7 +234,8 @@ void updateDisplay();
 void showStatusMessage(const char* message);
 void updateNextStopCount();
 void setLED(uint8_t red, uint8_t green);
-void blinkLEDBoth(int duration);
+void startBlink(unsigned long duration);
+void updateBlink();
 void updateLEDState();
 
 // ==================== 初始化位置缓存 ====================
@@ -253,27 +263,29 @@ void setLED(uint8_t red, uint8_t green) {
     digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
 }
 
-void blinkLEDBoth(int duration) {
-    unsigned long start = millis();
-    unsigned long lastBlink = 0;
-    bool redOn = true;
+// 非阻塞 LED 闪烁：设置状态，由 loop 每轮更新
+void startBlink(unsigned long duration) {
+    blinkActive = true;
+    blinkStartMs = millis();
+    blinkDurationMs = duration;
+    blinkLastPhase = 0;
+}
 
-    while (millis() - start < duration) {
-        if (millis() - lastBlink > 20) {
-            lastBlink = millis();
-            redOn = !redOn;
-            setLED(redOn ? 1 : 0, redOn ? 0 : 1);
-        }
-        // 在闪烁期间继续处理其他任务
-        processSerialInput();
-        if (isRunning == 1) {
-            // 在闪烁期间也保持电机状态检测
-            handleMotorState();
-        }
-        delay(LOOP_DELAY);
+// 在 loop 中调用，非阻塞更新 LED 闪烁
+void updateBlink() {
+    if (!blinkActive) return;
+    unsigned long now = millis();
+    if (now - blinkStartMs >= blinkDurationMs) {
+        blinkActive = false;
+        updateLEDState();
+        return;
     }
-    // 闪烁结束后恢复到当前状态
-    updateLEDState();
+    unsigned long elapsed = now - blinkStartMs;
+    uint8_t phase = (elapsed / 20) & 1;
+    if (phase != blinkLastPhase) {
+        blinkLastPhase = phase;
+        setLED(phase ? 0 : 1, phase ? 1 : 0);
+    }
 }
 
 void updateLEDState() {
@@ -346,6 +358,22 @@ void controlMotorB(bool enable) {
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, 0);
     }
+}
+
+// ==================== B电机平滑停止 ====================
+// 先降速到100运行8ms，再短路制动。
+// 这样动能显著减小，惯性带出第二张牌的概率降低；
+// 总停止时间与原 delay(8) 基本相同，不增加发牌周期。
+void controlMotorB_SlowStop() {
+    // 先减速：保持方向，PWM 降到 100
+    digitalWrite(MOTOR_B_IN1, LOW);
+    digitalWrite(MOTOR_B_IN2, HIGH);
+    analogWrite(MOTOR_B_PWM, 100);
+    delay(8);  // 减速阶段
+    // 短路制动
+    digitalWrite(MOTOR_B_IN1, HIGH);
+    digitalWrite(MOTOR_B_IN2, HIGH);
+    analogWrite(MOTOR_B_PWM, 0);
 }
 
 // ==================== 光电开关A计数（双边沿检测）====================
@@ -456,10 +484,11 @@ void updateStateFast() {
     lastCurrentState = currentState;
 }
 
-// ==================== 处理一张牌发出（先启电机，后刷LCD）====================
+// ==================== 处理一张牌发出（B平滑停止，先启电机后刷LCD）====================
 void processCard() {
-    // 停止电机B
-    controlMotorB(false);
+    // 平滑停止电机B：先减速再制动，减小惯性，防止带出第二张
+    controlMotorB_SlowStop();
+
     cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
     dealtCards++;
     lastCardTime = millis();
@@ -486,6 +515,9 @@ void processCard() {
         currentState = STATE_A_RUNNING;
         motorAStartTime = millis();
         lastPhotoATime = millis();
+        // A阶段时快照B光电状态，跟踪A期间B是否还有惯性活动
+        lastPhotoBInA = digitalRead(PHOTO_B_PIN);
+        bActivityInA = false;
     } else {
         // 异常：photoACount 多计，A 已越过目标位置。
         // 不能跳过 A 转动直接重启 B，否则会连续发牌并错位。
@@ -582,6 +614,8 @@ void resetDealCounts() {
     nextStopCount = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
+    bActivityInA = false;
+    lastPhotoBInA = HIGH;
     if (isRunning != 0) {
         stopDealing();
     }
@@ -628,6 +662,7 @@ void pauseDealing() {
         stopAllMotors();
         isRunning = 2;
         waitingCardClear = false;
+        bActivityInA = false;
 
         // 等电机停止、电源稳定，再重新初始化 LCD
         delay(20);
@@ -657,6 +692,8 @@ void resumeDealing() {
             waitingCardClear = false;
             cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
             lastPhotoBState = digitalRead(PHOTO_B_PIN);
+            lastPhotoBInA = lastPhotoBState;
+            bActivityInA = false;
         } else if (currentState == STATE_B_RUNNING) {
             lastPhotoBState = digitalRead(PHOTO_B_PIN);
             controlMotorB(true);
@@ -668,6 +705,7 @@ void resumeDealing() {
                 waitingCardClear = false;
                 cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
             }
+            bActivityInA = false;
         }
 
         isRunning = 1;
@@ -714,6 +752,7 @@ void startDealing() {
         }
         lastCardTime = millis();
         currentState = STATE_B_RUNNING;
+        bActivityInA = false;
         showStatusMessage("Start");
         delay(80);  // 进一步减少延迟
         updateDisplay();
@@ -734,6 +773,8 @@ void stopDealing() {
     dealtCards = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
+    bActivityInA = false;
+    lastPhotoBInA = HIGH;
     stopAllMotors();
 
     // 等电机停止、电源稳定后重新初始化 LCD
@@ -761,6 +802,15 @@ void handleMotorState() {
         case STATE_A_RUNNING:
             updatePhotoA();  // 检测旋转计数
 
+            // ★ A转动期间跟踪B光电，检测B惯性是否带出牌
+            {
+                uint8_t bNow = digitalRead(PHOTO_B_PIN);
+                if (bNow != lastPhotoBInA) {
+                    bActivityInA = true;
+                }
+                lastPhotoBInA = bNow;
+            }
+
             // 检查是否达到目标
             if (photoACount >= nextStopCount) {
                 controlMotorA(false);  // 停止电机A
@@ -778,6 +828,7 @@ void handleMotorState() {
                         waitingCardClear = false;
                         cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
                     }
+                    bActivityInA = false;
                     delay(2);
                     updateStateFast();         // 状态 A -> B，立即刷新
                 } else {
@@ -833,8 +884,10 @@ void processInfraredInput() {
             return;
         }
 
-        // 收到有效红外信号，红绿闪烁1秒（只保留红外接收时的LED闪烁）
-        blinkLEDBoth(200);
+        // 收到有效红外信号，非阻塞启动 LED 闪烁
+        // ★ 用 startBlink 替代原来的 blinkLEDBoth(200)，不再阻塞主循环，
+        //   避免电机干扰触发红外误码时把光电采样窗口堵死导致漏检
+        startBlink(150);
 
         lastIRCommandTime = now;
         lastIRCommandValue = irValue;
@@ -1328,6 +1381,8 @@ void resetSystem() {
     nextStopCount = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
+    bActivityInA = false;
+    lastPhotoBInA = HIGH;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
 
@@ -1618,6 +1673,9 @@ void loop() {
     if (isRunning == 1) {
         handleMotorState();
     }
+    // 非阻塞 LED 闪烁更新
+    updateBlink();
+
 #if DEBUG
     if (millis() - lastDebugTime > 3000) {
         Serial.print(F("Cards: "));
