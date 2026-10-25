@@ -19,7 +19,10 @@
 
 // 防抖时间（进一步减少以提高响应速度）
 #define PHOTO_A_DEBOUNCE 8         // 3ms 偏小，A码盘抖动会多计，改为8ms
-#define PHOTO_B_DEBOUNCE 10        // 从25ms减少到10ms
+#define PHOTO_B_DEBOUNCE 5         // 从10ms降到5ms，覆盖更短的LOW窗口，减少漏检
+
+// 连发检测：B重启后至少需要这么久才可能正常出牌，短于此判定为连发
+#define B_RESTART_MIN_TIME 80
 
 // 循环延迟（进一步减少以提高响应速度）
 #define LOOP_DELAY 1               // 从2ms减少到1ms
@@ -144,6 +147,9 @@ bool waitingCardClear = false;            // 等待旧牌离开光电，防止B�
 uint8_t lastPhotoBInA = HIGH;             // A转动期间跟踪光电B状态
 bool bActivityInA = false;                // A转动期间检测到光电B活动，说明B惯性带出牌
 
+// ---- 连发检测 ----
+unsigned long bRestartTime = 0;           // 电机B最近一次启动时间，用于连发检测
+
 // ---- 非阻塞 LED 闪烁状态 ----
 bool blinkActive = false;
 unsigned long blinkStartMs = 0;
@@ -211,7 +217,7 @@ void disableMotorDriver();
 void stopAllMotors();
 void controlMotorA(bool enable);
 void controlMotorB(bool enable);
-void controlMotorB_SlowStop();
+//void controlMotorB_SlowStop();
 void startDealing();
 void pauseDealing();
 void resumeDealing();
@@ -353,6 +359,8 @@ void controlMotorB(bool enable) {
         digitalWrite(MOTOR_B_IN1, LOW);
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED_VAL);
+        // 记录B启动时间，用于连发检测
+        bRestartTime = millis();
     } else {
         digitalWrite(MOTOR_B_IN1, HIGH);
         digitalWrite(MOTOR_B_IN2, HIGH);
@@ -364,6 +372,7 @@ void controlMotorB(bool enable) {
 // 先降速到100运行8ms，再短路制动。
 // 这样动能显著减小，惯性带出第二张牌的概率降低；
 // 总停止时间与原 delay(8) 基本相同，不增加发牌周期。
+/*
 void controlMotorB_SlowStop() {
     // 先减速：保持方向，PWM 降到 100
     digitalWrite(MOTOR_B_IN1, LOW);
@@ -375,7 +384,7 @@ void controlMotorB_SlowStop() {
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, 0);
 }
-
+*/
 // ==================== 光电开关A计数（双边沿检测）====================
 void updatePhotoA() {
     if (currentState != STATE_A_RUNNING) return;
@@ -484,10 +493,29 @@ void updateStateFast() {
     lastCurrentState = currentState;
 }
 
-// ==================== 处理一张牌发出（B平滑停止，先启电机后刷LCD）====================
+// ==================== 处理一张牌发出（先做连发检测，再停B启A）====================
 void processCard() {
+    unsigned long now = millis();
+
+    // ★ 连发检测：B重启后极短时间内就检测到牌，说明牌已经在光电处附近，判定连发
+    // 正常B启动到第一张牌出来需要送牌时间，远大于 B_RESTART_MIN_TIME
+    if (bRestartTime != 0 && (now - bRestartTime) < B_RESTART_MIN_TIME) {
+        // 立即停两个电机，防止继续出牌
+        controlMotorB(false);
+        controlMotorA(false);
+        bRestartTime = 0;
+        // 暂停发牌并提示
+        pauseDealing();
+        showStatusMessage("Double!");
+        delay(150);
+        updateDisplay();
+        return;
+    }
+
     // 平滑停止电机B：先减速再制动，减小惯性，防止带出第二张
-    controlMotorB_SlowStop();
+    //controlMotorB_SlowStop();
+    controlMotorB(false);
+    delay(8);   // 等电机停稳，这 8ms 内 B 已停止，不会推牌
 
     cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
     dealtCards++;
@@ -616,6 +644,7 @@ void resetDealCounts() {
     waitingCardClear = false;
     bActivityInA = false;
     lastPhotoBInA = HIGH;
+    bRestartTime = 0;
     if (isRunning != 0) {
         stopDealing();
     }
@@ -663,6 +692,7 @@ void pauseDealing() {
         isRunning = 2;
         waitingCardClear = false;
         bActivityInA = false;
+        bRestartTime = 0;
 
         // 等电机停止、电源稳定，再重新初始化 LCD
         delay(20);
@@ -685,6 +715,7 @@ void resumeDealing() {
 
         // 重置所有与超时相关的计时器，防止恢复后立即再次超时
         lastCardTime = millis();               // 电机B超时计时
+        bRestartTime = 0;                       // 恢复时清空，防止误判
         if (currentState == STATE_A_RUNNING) {
             motorAStartTime = millis();        // 电机A超时计时
             lastPhotoATime = millis();          // 电机A停滞检测计时
@@ -775,6 +806,7 @@ void stopDealing() {
     waitingCardClear = false;
     bActivityInA = false;
     lastPhotoBInA = HIGH;
+    bRestartTime = 0;
     stopAllMotors();
 
     // 等电机停止、电源稳定后重新初始化 LCD
@@ -817,7 +849,7 @@ void handleMotorState() {
                 if (dealtCards < totalCards) {
                     // 重启B前同步光电B状态；若旧牌还在光电处，进入等待清除模式
                     lastPhotoBState = digitalRead(PHOTO_B_PIN);
-                    controlMotorB(true);
+                    controlMotorB(true);   // 内部会记录 bRestartTime
                     currentState = STATE_B_RUNNING;
                     lastCardTime = millis();
                     if (lastPhotoBState == LOW) {
@@ -1383,6 +1415,7 @@ void resetSystem() {
     waitingCardClear = false;
     bActivityInA = false;
     lastPhotoBInA = HIGH;
+    bRestartTime = 0;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
 
