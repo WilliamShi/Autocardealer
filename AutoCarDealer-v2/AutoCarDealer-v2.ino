@@ -5,33 +5,50 @@
 #define DEBUG 0                    // 调试信息输出
 #define IR_DEBUG 0                 // 红外详细调试（开启以便观察干扰）
 
+// ==================== 轻量刷新开关 ====================
+// 0 = 关闭（默认）：所有刷新点都用原来的 updateDisplay()，功能与旧版一致
+// 1 = 开启：使用 updateDealtFast()/updateStateFast() 轻量刷新（当前版本行为）
+#define ENABLE_FAST_LCD 0
+
+// ==================== 漏检补偿开关 ====================
+// 0 = 关闭（推荐）：卡牌慢能正常等待检测，卡死 3 秒才暂停。
+//     代价：漏检时牌2出来被算作1张，物理上会连发。
+// 1 = 开启：700ms 无牌就假设漏检，补偿计数后转A。
+//     代价：牌仓卡住、出牌变慢时会被误判为漏检，牌没出来就转走A。
+#define ENABLE_MISS_COMPENSATION 0
+
 // ==================== 优化参数配置 ====================
-// 电机速度（已经是最大255）
+// 电机速度
 #define MOTOR_A_SPEED 255
-#define MOTOR_B_SPEED 230
+#define MOTOR_B_SPEED 199               // ★ 全速巡航
 
-// 超时时间（进一步减少以加快错误恢复）
-#define MOTOR_B_TIMEOUT 8000       // 从4000ms减少到3000ms
-#define MOTOR_A_TIMEOUT 1500       // 从2000ms减少到1500ms
+// ★ 渐进制动参数：全速下停止时逐级降速，减小惯性防连发
+//#define MOTOR_B_BRAKE_S1_SPEED 150       // 制动阶段1：降到 180
+//#define MOTOR_B_BRAKE_S1_MS 4            // 阶段1 持续 4ms
+//#define MOTOR_B_BRAKE_S2_SPEED 60        // 制动阶段2：降到 90
+//#define MOTOR_B_BRAKE_S2_MS 4            // 阶段2 持续 4ms
+//#define MOTOR_B_BRAKE_FINAL_MS 15        // 阶段3：短路制动 10ms
 
-// 消隐窗口（进一步减少以提高发牌频率）
-#define CARD_IGNORE_TIME 70        // 从150ms减少到80ms
+// 超时时间
+#define MOTOR_B_MISS_TIMEOUT 700         // 仅 ENABLE_MISS_COMPENSATION=1 时生效
+#define MOTOR_B_HARD_TIMEOUT 3000        // 硬超时：无论开关如何，3 秒无牌 → 暂停报警
+#define MOTOR_A_TIMEOUT 1500
 
-// 防抖时间（进一步减少以提高响应速度）
-#define PHOTO_A_DEBOUNCE 8         // 3ms 偏小，A码盘抖动会多计，改为8ms
-#define PHOTO_B_DEBOUNCE 5         // 从10ms降到5ms，覆盖更短的LOW窗口，减少漏检
+// 消隐窗口
+#define CARD_IGNORE_TIME 80
 
-// 连发检测：B重启后至少需要这么久才可能正常出牌，短于此判定为连发
-#define B_RESTART_MIN_TIME 80
+// 防抖时间
+#define PHOTO_A_DEBOUNCE 8
+#define PHOTO_B_DEBOUNCE 10
 
-// 循环延迟（进一步减少以提高响应速度）
-#define LOOP_DELAY 1               // 从2ms减少到1ms
+// 循环延迟
+#define LOOP_DELAY 1
 
-// 红外防抖（进一步减少）
-#define IR_DEBOUNCE_TIME 150       // 从200ms减少到150ms
+// 红外防抖
+#define IR_DEBOUNCE_TIME 150
 
-// 电机A停滞检测时间（进一步减少）
-#define MOTOR_A_STUCK_TIME 500     // 从800ms减少到500ms
+// 电机A停滞检测时间
+#define MOTOR_A_STUCK_TIME 500
 
 // ==================== 红外遥控键码定义（第一遥控器）====================
 #if ENABLE_INFRA
@@ -51,7 +68,6 @@
 #define IR_VERSION        0xF708FF00 //4
 #define IR_REBOOT         0xB54AFF00 //重启键（按钮9）
 
-// 新增比分调整键（已用IR_DEBUG获取实际值）
 #define IR_SCORE_X_INC    0xE31CFF00 // 按钮5：X加1
 #define IR_SCORE_X_DEC    0xA55AFF00 // 按钮6：X减1
 #define IR_SCORE_Y_INC    0xBD42FF00 // 按钮7：Y加1
@@ -124,11 +140,12 @@ uint8_t isRunning = 0;          // 0:停止 1:运行 2:暂停
 // ---- 电机控制参数 ----
 const int MOTOR_A_SPEED_VAL = MOTOR_A_SPEED;
 const int MOTOR_B_SPEED_VAL = MOTOR_B_SPEED;
-unsigned long motorBTimeout = MOTOR_B_TIMEOUT;
+unsigned long motorBMissTimeout = MOTOR_B_MISS_TIMEOUT;
+unsigned long motorBHardTimeout = MOTOR_B_HARD_TIMEOUT;
 unsigned long motorATimeout = MOTOR_A_TIMEOUT;
 
-// ---- 旋转方向（true=顺时针，false=逆时针）----
-bool clockwise = true;  // 缺省方向改为顺时针
+// ---- 旋转方向 ----
+bool clockwise = true;
 
 // ---- 光电开关A相关 ----
 volatile uint16_t photoACount = 0;
@@ -136,19 +153,17 @@ uint16_t nextStopCount = 0;
 uint8_t lastPhotoAState = HIGH;
 unsigned long photoADebounce = 0;
 unsigned long motorAStartTime = 0;
-unsigned long lastPhotoATime = 0;         // 最后一次光电A计数时间，用于停滞检测
+unsigned long lastPhotoATime = 0;
 
 // ---- 光电开关B相关 ----
 uint8_t lastPhotoBState = HIGH;
 unsigned long photoBDebounce = 0;
 unsigned long lastCardTime = 0;
-unsigned long cardIgnoreUntil = 0;        // 发牌后消隐窗口结束时间
-bool waitingCardClear = false;            // 等待旧牌离开光电，防止B重启后旧牌抖动被多计
-uint8_t lastPhotoBInA = HIGH;             // A转动期间跟踪光电B状态
-bool bActivityInA = false;                // A转动期间检测到光电B活动，说明B惯性带出牌
+unsigned long cardIgnoreUntil = 0;
+bool waitingCardClear = false;
 
-// ---- 连发检测 ----
-unsigned long bRestartTime = 0;           // 电机B最近一次启动时间，用于连发检测
+// ---- 漏检补偿（仅 ENABLE_MISS_COMPENSATION=1 时使用）----
+uint8_t assumedMissed = 0;
 
 // ---- 非阻塞 LED 闪烁状态 ----
 bool blinkActive = false;
@@ -172,13 +187,13 @@ unsigned long lastIRCommandValue = 0;
 const unsigned long IR_DEBOUNCE_TIME_VAL = IR_DEBOUNCE_TIME;
 
 // ==================== 新增比分变量 ====================
-uint8_t scoreX = 2;   // 默认02
-uint8_t scoreY = 2;   // 默认02
+uint8_t scoreX = 2;
+uint8_t scoreY = 2;
 
 // ==================== 软件复位函数指针 ====================
-void (*resetFunc)(void) = 0;  // 指向地址0，调用即复位
+void (*resetFunc)(void) = 0;
 
-// ==================== 上次显示的值（用于局部刷新）====================
+// ==================== 上次显示的值 ====================
 uint8_t lastPlayerCount = 0;
 uint8_t lastDeckCount = 0;
 uint8_t lastHasJokers = 0;
@@ -192,23 +207,23 @@ SystemState lastCurrentState = STATE_IDLE;
 uint16_t lastPhotoACount = 0;
 
 // ==================== 全局刷新标志 ====================
-bool fullRefresh = true;   // 初始需要全刷新
+bool fullRefresh = true;
 
 // ==================== 基于16计数每圈的发牌位置表 ====================
 const uint8_t basePositions16[9][8] = {
-    {0},       // 0人（未用）
-    {0},       // 1人（未用）
-    {0, 8},    // 2人
-    {0, 5, 11}, // 3人
-    {0, 4, 8, 12}, // 4人
-    {0, 3, 7, 10, 13}, // 5人
-    {0, 3, 6, 8, 11, 14}, // 6人
-    {0, 3, 5, 7, 9, 11, 13}, // 7人
-    {0, 2, 4, 6, 8, 10, 12, 14} // 8人
+    {0},
+    {0},
+    {0, 8},
+    {0, 5, 11},
+    {0, 4, 8, 12},
+    {0, 3, 7, 10, 13},
+    {0, 3, 6, 8, 11, 14},
+    {0, 3, 5, 7, 9, 11, 13},
+    {0, 2, 4, 6, 8, 10, 12, 14}
 };
 
 // ==================== 预计算位置缓存 ====================
-uint16_t nextStopCache[256];  // 缓存最多256张牌的位置
+uint16_t nextStopCache[256];
 bool cacheInitialized = false;
 
 // ==================== 函数声明 ====================
@@ -217,15 +232,17 @@ void disableMotorDriver();
 void stopAllMotors();
 void controlMotorA(bool enable);
 void controlMotorB(bool enable);
-//void controlMotorB_SlowStop();
+void stopMotorBFast();              // ★ 新增：渐进制动
 void startDealing();
 void pauseDealing();
 void resumeDealing();
 void stopDealing();
 void updatePhotoA();
 void updatePhotoB();
+#if ENABLE_FAST_LCD
 void updateDealtFast();
 void updateStateFast();
+#endif
 void handleMotorState();
 void resetSystem();
 void performInitialHoming();
@@ -243,11 +260,13 @@ void setLED(uint8_t red, uint8_t green);
 void startBlink(unsigned long duration);
 void updateBlink();
 void updateLEDState();
+#if ENABLE_MISS_COMPENSATION
+void handleBMiss();
+#endif
 
 // ==================== 初始化位置缓存 ====================
 void initPositionCache() {
     if (playerCount < 2 || playerCount > 8) {
-        // 如果playerCount无效，用默认值初始化
         for (int i = 0; i < 256; i++) {
             nextStopCache[i] = 0;
         }
@@ -269,7 +288,6 @@ void setLED(uint8_t red, uint8_t green) {
     digitalWrite(LED_GREEN_PIN, green ? HIGH : LOW);
 }
 
-// 非阻塞 LED 闪烁：设置状态，由 loop 每轮更新
 void startBlink(unsigned long duration) {
     blinkActive = true;
     blinkStartMs = millis();
@@ -277,7 +295,6 @@ void startBlink(unsigned long duration) {
     blinkLastPhase = 0;
 }
 
-// 在 loop 中调用，非阻塞更新 LED 闪烁
 void updateBlink() {
     if (!blinkActive) return;
     unsigned long now = millis();
@@ -296,21 +313,18 @@ void updateBlink() {
 
 void updateLEDState() {
     if (isRunning == 0) {
-        // 停止状态：红色
         setLED(1, 0);
     } else if (isRunning == 1) {
-        // 运行状态：绿色
         setLED(0, 1);
     } else if (isRunning == 2) {
-        // 暂停状态：红色+绿色（黄色）
         setLED(1, 1);
     }
 }
 
-// ==================== 电机控制函数（优化快速停止）====================
+// ==================== 电机控制函数 ====================
 void enableMotorDriver() {
     digitalWrite(MOTOR_STBY, HIGH);
-    delay(2);  // 进一步减少延迟
+    delay(2);
 }
 
 void disableMotorDriver() {
@@ -324,7 +338,7 @@ void stopAllMotors() {
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, 0);
-    delay(2);  // 进一步减少延迟
+    delay(2);
 }
 
 void controlMotorA(bool enable) {
@@ -332,7 +346,7 @@ void controlMotorA(bool enable) {
         digitalWrite(MOTOR_A_IN1, HIGH);
         digitalWrite(MOTOR_A_IN2, HIGH);
         analogWrite(MOTOR_A_PWM, 255);
-        delayMicroseconds(100);  // 减少到100微秒
+        delayMicroseconds(100);
         if (clockwise) {
             digitalWrite(MOTOR_A_IN1, LOW);
             digitalWrite(MOTOR_A_IN2, HIGH);
@@ -343,10 +357,9 @@ void controlMotorA(bool enable) {
         analogWrite(MOTOR_A_PWM, MOTOR_A_SPEED_VAL);
         motorAStartTime = millis();
         lastPhotoATime = millis();
-        // 重置A光电基准状态，防止A启动时因状态与上次停止时不同而多计
         lastPhotoAState = digitalRead(PHOTO_A_PIN);
         photoADebounce = millis() - PHOTO_A_DEBOUNCE - 1;
-        delayMicroseconds(100);  // 减少到100微秒
+        delayMicroseconds(100);
     } else {
         digitalWrite(MOTOR_A_IN1, HIGH);
         digitalWrite(MOTOR_A_IN2, HIGH);
@@ -359,33 +372,46 @@ void controlMotorB(bool enable) {
         digitalWrite(MOTOR_B_IN1, LOW);
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, MOTOR_B_SPEED_VAL);
-        // 记录B启动时间，用于连发检测
-        bRestartTime = millis();
     } else {
+        // 关闭时直接短路制动（非渐进，用于完全停止场景）
         digitalWrite(MOTOR_B_IN1, HIGH);
         digitalWrite(MOTOR_B_IN2, HIGH);
         analogWrite(MOTOR_B_PWM, 0);
     }
 }
 
-// ==================== B电机平滑停止 ====================
-// 先降速到100运行8ms，再短路制动。
-// 这样动能显著减小，惯性带出第二张牌的概率降低；
-// 总停止时间与原 delay(8) 基本相同，不增加发牌周期。
+// ==================== B电机渐进制动（★ 核心新增）====================
+// 全速巡航时停止 B，通过逐级降速让动能平稳释放，防止惯性带出下一张牌。
+// 阶段1：PWM 255 → 180，4ms
+// 阶段2：PWM 180 → 90，4ms
+// 阶段3：短路制动，10ms
+// 总 18ms，比原来的 delay(10) 多 8ms，但因为巡航从 180 提到 255，
+// 每张牌运行时间大幅缩短，整体发牌更快。
 /*
-void controlMotorB_SlowStop() {
-    // 先减速：保持方向，PWM 降到 100
+void stopMotorBFast() {
+    // 阶段1：降到 180（保持方向）
     digitalWrite(MOTOR_B_IN1, LOW);
     digitalWrite(MOTOR_B_IN2, HIGH);
-    analogWrite(MOTOR_B_PWM, 100);
-    delay(8);  // 减速阶段
-    // 短路制动
+    analogWrite(MOTOR_B_PWM, MOTOR_B_BRAKE_S1_SPEED);
+    delay(MOTOR_B_BRAKE_S1_MS);
+
+    // 阶段2：降到 90（保持方向）
+    analogWrite(MOTOR_B_PWM, MOTOR_B_BRAKE_S2_SPEED);
+    delay(MOTOR_B_BRAKE_S2_MS);
+
+    // 阶段3：短路制动
     digitalWrite(MOTOR_B_IN1, HIGH);
     digitalWrite(MOTOR_B_IN2, HIGH);
     analogWrite(MOTOR_B_PWM, 0);
+    delay(MOTOR_B_BRAKE_FINAL_MS);
 }
 */
-// ==================== 光电开关A计数（双边沿检测）====================
+void stopMotorBFast() {
+    controlMotorB(false);
+    delay(10);
+}
+
+// ==================== 光电开关A计数 ====================
 void updatePhotoA() {
     if (currentState != STATE_A_RUNNING) return;
 
@@ -406,18 +432,12 @@ void updatePhotoA() {
 }
 
 // ==================== 光电开关B检测 ====================
-// 关键修复：
-// 1. 消隐窗口内不计数，但仍然同步 lastPhotoBState，防止窗口结束时旧状态误触发
-// 2. 触发后重新读取光电状态，避免 processCard 改变状态后用旧值覆盖
-// 3. waitingCardClear：A到位启动B时若旧牌仍在光电处，先等它稳定HIGH再开始消隐计数，
-//    彻底防止旧牌在B重启后被推走过程中的抖动被当成新牌多计
 void updatePhotoB() {
     if (isRunning != 1 || currentState != STATE_B_RUNNING) return;
 
     uint8_t currentStateB = digitalRead(PHOTO_B_PIN);
     unsigned long now = millis();
 
-    // 等待旧牌离开光电
     if (waitingCardClear) {
         if (currentStateB == HIGH) {
             waitingCardClear = false;
@@ -434,19 +454,17 @@ void updatePhotoB() {
             if (now - photoBDebounce > PHOTO_B_DEBOUNCE) {
                 photoBDebounce = now;
                 processCard();
-                // processCard 可能启动A或暂停，重新读取实际光电状态，避免旧值覆盖
                 lastPhotoBState = digitalRead(PHOTO_B_PIN);
                 return;
             }
         }
     }
 
-    // 无论是否在消隐窗口，都同步最新光电状态
     lastPhotoBState = currentStateB;
 }
 
-// ==================== 轻量刷新：已发牌数（每张调用）====================
-// 只刷新第二行第2~4列，格式与 updateDisplay() 的 "%-3d" 一致
+// ==================== 轻量刷新（仅 ENABLE_FAST_LCD=1 时编译）====================
+#if ENABLE_FAST_LCD
 void updateDealtFast() {
     uint8_t h = dealtCards / 100;
     uint8_t t = (dealtCards / 10) % 10;
@@ -467,11 +485,9 @@ void updateDealtFast() {
         lcd.write(' ');
     }
 
-    lastDealtCards = dealtCards;   // 同步 last，避免下次 updateDisplay 重复写
+    lastDealtCards = dealtCards;
 }
 
-// ==================== 轻量刷新：状态字符（B/A/P/S）====================
-// 只刷新第二行第10列，状态从 B 切 A 或 A 切 B 时保持显示正确
 void updateStateFast() {
     uint8_t stateChar;
     if (isRunning == 1) {
@@ -492,32 +508,16 @@ void updateStateFast() {
     lastIsRunning = isRunning;
     lastCurrentState = currentState;
 }
+#endif
 
-// ==================== 处理一张牌发出（先做连发检测，再停B启A）====================
+// ==================== 处理一张牌发出（光电触发）====================
 void processCard() {
-    unsigned long now = millis();
+    // ★ 全速下渐进制动：逐级降速 + 短路制动，防止惯性带出下一张
+    stopMotorBFast();
 
-    // ★ 连发检测：B重启后极短时间内就检测到牌，说明牌已经在光电处附近，判定连发
-    // 正常B启动到第一张牌出来需要送牌时间，远大于 B_RESTART_MIN_TIME
-    if (bRestartTime != 0 && (now - bRestartTime) < B_RESTART_MIN_TIME) {
-        // 立即停两个电机，防止继续出牌
-        controlMotorB(false);
-        controlMotorA(false);
-        bRestartTime = 0;
-        // 暂停发牌并提示
-        pauseDealing();
-        showStatusMessage("Double!");
-        delay(150);
-        updateDisplay();
-        return;
-    }
+    assumedMissed = 0;
 
-    // 平滑停止电机B：先减速再制动，减小惯性，防止带出第二张
-    //controlMotorB_SlowStop();
-    controlMotorB(false);
-    delay(8);   // 等电机停稳，这 8ms 内 B 已停止，不会推牌
-
-    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;  // 使用优化的消隐窗口
+    cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
     dealtCards++;
     lastCardTime = millis();
 
@@ -529,26 +529,19 @@ void processCard() {
     if (dealtCards >= totalCards && totalCards > 0) {
         stopDealing();
         showStatusMessage("All Done!");
-        delay(150);  // 进一步减少延迟
+        delay(150);
         updateDisplay();
         return;
     }
 
-    // 先计算下一次停止计数
     updateNextStopCount();
 
-    // 先启动电机，避免 LCD 刷新阻塞电机启动
     if (nextStopCount > photoACount) {
         controlMotorA(true);
         currentState = STATE_A_RUNNING;
         motorAStartTime = millis();
         lastPhotoATime = millis();
-        // A阶段时快照B光电状态，跟踪A期间B是否还有惯性活动
-        lastPhotoBInA = digitalRead(PHOTO_B_PIN);
-        bActivityInA = false;
     } else {
-        // 异常：photoACount 多计，A 已越过目标位置。
-        // 不能跳过 A 转动直接重启 B，否则会连续发牌并错位。
         controlMotorA(false);
         pauseDealing();
         showStatusMessage("A Count Err");
@@ -557,8 +550,9 @@ void processCard() {
         return;
     }
 
-    // 电机启动后再做轻量 LCD 刷新；每50张全刷新一次，自愈轻微错位
+    // ==================== LCD 刷新 ====================
     delay(2);
+#if ENABLE_FAST_LCD
     if ((dealtCards % 50) == 0) {
         fullRefresh = true;
         updateDisplay();
@@ -566,12 +560,70 @@ void processCard() {
         updateDealtFast();
         updateStateFast();
     }
+#else
+    updateDisplay();
+#endif
 }
+
+// ==================== 漏检补偿（仅 ENABLE_MISS_COMPENSATION=1 时编译）====================
+#if ENABLE_MISS_COMPENSATION
+void handleBMiss() {
+    if (assumedMissed < 2) {
+        assumedMissed++;
+
+#if DEBUG
+        Serial.print(F("B Miss assumed: "));
+        Serial.println(assumedMissed);
+#endif
+
+        controlMotorB(false);
+        delay(10);
+
+        dealtCards++;
+        cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
+
+        if (dealtCards >= totalCards) {
+            stopDealing();
+            showStatusMessage("All Done!");
+            delay(150);
+            updateDisplay();
+            return;
+        }
+
+        updateNextStopCount();
+        if (nextStopCount > photoACount) {
+            controlMotorA(true);
+            currentState = STATE_A_RUNNING;
+            motorAStartTime = millis();
+            lastPhotoATime = millis();
+        } else {
+            controlMotorB(true);
+            currentState = STATE_B_RUNNING;
+            cardIgnoreUntil = 0;
+            lastPhotoBState = HIGH;
+            waitingCardClear = false;
+        }
+        lastCardTime = millis();
+
+        delay(2);
+#if ENABLE_FAST_LCD
+        updateDealtFast();
+        updateStateFast();
+#else
+        updateDisplay();
+#endif
+    } else {
+        assumedMissed = 0;
+        pauseDealing();
+        showStatusMessage("B Stuck");
+    }
+}
+#endif
 
 // ==================== 上电归位 ====================
 void performInitialHoming() {
     enableMotorDriver();
-    delay(30);  // 进一步减少延迟
+    delay(30);
 
     lcd.clear();
     lcd.print("Homing MotorA...");
@@ -579,14 +631,14 @@ void performInitialHoming() {
     unsigned long startTime = millis();
     uint8_t lastState = digitalRead(PHOTO_A_PIN);
     bool found = false;
-    while (millis() - startTime < 5000) {  // 减少到5秒
+    while (millis() - startTime < 5000) {
         uint8_t curState = digitalRead(PHOTO_A_PIN);
         if (curState == LOW && lastState == HIGH) {
             found = true;
             break;
         }
         lastState = curState;
-        delay(2);  // 进一步减少延迟
+        delay(2);
     }
     controlMotorA(false);
     lcd.setCursor(0, 1);
@@ -595,7 +647,7 @@ void performInitialHoming() {
     } else {
         lcd.print("A TO");
     }
-    delay(150);  // 进一步减少延迟
+    delay(150);
     lcd.clear();
 }
 
@@ -603,7 +655,7 @@ void performInitialHoming() {
 void calibrateMotorA() {
     stopAllMotors();
     enableMotorDriver();
-    delay(30);  // 进一步减少延迟
+    delay(30);
 
     lcd.setCursor(0, 1);
     lcd.print("Calib A...      ");
@@ -612,14 +664,14 @@ void calibrateMotorA() {
     unsigned long startTime = millis();
     uint8_t lastState = digitalRead(PHOTO_A_PIN);
     bool found = false;
-    while (millis() - startTime < 5000) {  // 减少到5秒
+    while (millis() - startTime < 5000) {
         uint8_t curState = digitalRead(PHOTO_A_PIN);
         if (curState == LOW && lastState == HIGH) {
             found = true;
             break;
         }
         lastState = curState;
-        delay(2);  // 进一步减少延迟
+        delay(2);
     }
     controlMotorA(false);
 
@@ -629,8 +681,7 @@ void calibrateMotorA() {
     } else {
         lcd.print("A TO           ");
     }
-    delay(300);  // 进一步减少延迟
-    // 临时消息覆盖了第二行，需要全刷新恢复固定字符
+    delay(300);
     fullRefresh = true;
     updateDisplay();
 }
@@ -642,17 +693,15 @@ void resetDealCounts() {
     nextStopCount = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
-    bActivityInA = false;
-    lastPhotoBInA = HIGH;
-    bRestartTime = 0;
+    assumedMissed = 0;
     if (isRunning != 0) {
         stopDealing();
     }
-    updateDisplay();                 // 先更新显示
+    updateDisplay();
     lcd.setCursor(0, 1);
-    lcd.print(F("Counts reset"));    // 覆盖第二行
-    delay(150);  // 进一步减少延迟
-    fullRefresh = true;               // 需要全刷新恢复固定字符
+    lcd.print(F("Counts reset"));
+    delay(150);
+    fullRefresh = true;
     updateDisplay();
 }
 
@@ -660,12 +709,10 @@ void resetDealCounts() {
 void updateNextStopCount() {
     if (playerCount < 2 || playerCount > 8) return;
 
-    // 如果缓存未初始化或playerCount可能变化，确保缓存有效
     if (!cacheInitialized) {
         initPositionCache();
     }
 
-    // 使用缓存提高速度
     if (dealtCards < 256) {
         nextStopCount = nextStopCache[dealtCards];
     } else {
@@ -685,16 +732,12 @@ void updateNextStopCount() {
 }
 
 // ==================== 暂停/恢复 ====================
-// 暂停时电机已停止，等电源稳定后重新初始化LCD，修复可能的移位/乱码
 void pauseDealing() {
     if (isRunning == 1) {
         stopAllMotors();
         isRunning = 2;
         waitingCardClear = false;
-        bActivityInA = false;
-        bRestartTime = 0;
 
-        // 等电机停止、电源稳定，再重新初始化 LCD
         delay(20);
         lcd.begin(16, 2);
         delay(5);
@@ -713,35 +756,29 @@ void resumeDealing() {
     if (isRunning == 2) {
         enableMotorDriver();
 
-        // 重置所有与超时相关的计时器，防止恢复后立即再次超时
-        lastCardTime = millis();               // 电机B超时计时
-        bRestartTime = 0;                       // 恢复时清空，防止误判
+        lastCardTime = millis();
+        assumedMissed = 0;
         if (currentState == STATE_A_RUNNING) {
-            motorAStartTime = millis();        // 电机A超时计时
-            lastPhotoATime = millis();          // 电机A停滞检测计时
+            motorAStartTime = millis();
+            lastPhotoATime = millis();
             controlMotorA(true);
             waitingCardClear = false;
             cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
             lastPhotoBState = digitalRead(PHOTO_B_PIN);
-            lastPhotoBInA = lastPhotoBState;
-            bActivityInA = false;
         } else if (currentState == STATE_B_RUNNING) {
             lastPhotoBState = digitalRead(PHOTO_B_PIN);
             controlMotorB(true);
             if (lastPhotoBState == LOW) {
-                // 旧牌还在光电处，等它离开再计数，防止恢复后旧牌抖动被多计
                 waitingCardClear = true;
                 cardIgnoreUntil = millis() + 2000;
             } else {
                 waitingCardClear = false;
                 cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
             }
-            bActivityInA = false;
         }
 
         isRunning = 1;
 
-        // 电机刚启动，等电流冲击过去再刷 LCD；此时不做 lcd.begin，避免电源不稳时初始化失败
         delay(10);
         fullRefresh = true;
         updateDisplay();
@@ -758,7 +795,7 @@ void startDealing() {
     if (isRunning == 0) {
         if (totalCards <= 0) {
             showStatusMessage("No Cards!");
-            delay(150);  // 进一步减少延迟
+            delay(150);
             updateDisplay();
             return;
         }
@@ -766,15 +803,14 @@ void startDealing() {
         dealtCards = 0;
         photoACount = 0;
         nextStopCount = 0;
+        assumedMissed = 0;
 
         stopAllMotors();
         enableMotorDriver();
 
-        // 启动电机B开始发牌，先同步光电B状态
         lastPhotoBState = digitalRead(PHOTO_B_PIN);
         controlMotorB(true);
         if (lastPhotoBState == LOW) {
-            // 启动时光电已有牌遮挡，等它离开再计数
             waitingCardClear = true;
             cardIgnoreUntil = millis() + 2000;
         } else {
@@ -783,11 +819,10 @@ void startDealing() {
         }
         lastCardTime = millis();
         currentState = STATE_B_RUNNING;
-        bActivityInA = false;
         showStatusMessage("Start");
-        delay(80);  // 进一步减少延迟
+        delay(80);
         updateDisplay();
-        updateLEDState();  // 更新LED为运行状态（绿）- 直接更新，不闪烁
+        updateLEDState();
     } else if (isRunning == 1) {
         pauseDealing();
     } else if (isRunning == 2) {
@@ -804,71 +839,66 @@ void stopDealing() {
     dealtCards = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
-    bActivityInA = false;
-    lastPhotoBInA = HIGH;
-    bRestartTime = 0;
+    assumedMissed = 0;
     stopAllMotors();
 
-    // 等电机停止、电源稳定后重新初始化 LCD
     delay(20);
     lcd.begin(16, 2);
     delay(10);
     fullRefresh = true;
     updateDisplay();
-    updateLEDState();  // 更新LED为停止状态（红）- 直接更新，不闪烁
+    updateLEDState();
 }
 
 // ==================== 状态机处理 ====================
 void handleMotorState() {
     switch (currentState) {
         case STATE_B_RUNNING:
-            updatePhotoB();  // 检测出牌
-            // 电机B超时检测（基于最后出牌时间）
-            if (millis() - lastCardTime > motorBTimeout) {
-                // pauseDealing 内部会停电机、delay 20ms、lcd.begin 修复移位/乱码
+            updatePhotoB();
+
+            // 硬超时：无论漏检补偿开关如何，3 秒无牌 → 暂停报警
+            if (millis() - lastCardTime > motorBHardTimeout) {
+                assumedMissed = 0;
                 pauseDealing();
                 showStatusMessage("B Timeout");
+                break;
             }
+
+#if ENABLE_MISS_COMPENSATION
+            if (millis() - lastCardTime > motorBMissTimeout) {
+                handleBMiss();
+            }
+#endif
             break;
 
         case STATE_A_RUNNING:
-            updatePhotoA();  // 检测旋转计数
+            updatePhotoA();
 
-            // ★ A转动期间跟踪B光电，检测B惯性是否带出牌
-            {
-                uint8_t bNow = digitalRead(PHOTO_B_PIN);
-                if (bNow != lastPhotoBInA) {
-                    bActivityInA = true;
-                }
-                lastPhotoBInA = bNow;
-            }
-
-            // 检查是否达到目标
             if (photoACount >= nextStopCount) {
-                controlMotorA(false);  // 停止电机A
+                controlMotorA(false);
                 if (dealtCards < totalCards) {
-                    // 重启B前同步光电B状态；若旧牌还在光电处，进入等待清除模式
                     lastPhotoBState = digitalRead(PHOTO_B_PIN);
-                    controlMotorB(true);   // 内部会记录 bRestartTime
+                    controlMotorB(true);
                     currentState = STATE_B_RUNNING;
                     lastCardTime = millis();
                     if (lastPhotoBState == LOW) {
-                        // 旧牌仍在光电处，B重启后先等它稳定HIGH，再开始消隐计数
                         waitingCardClear = true;
                         cardIgnoreUntil = millis() + 2000;
                     } else {
                         waitingCardClear = false;
-                        cardIgnoreUntil = millis() + CARD_IGNORE_TIME;
+                        cardIgnoreUntil = 0;
                     }
-                    bActivityInA = false;
                     delay(2);
-                    updateStateFast();         // 状态 A -> B，立即刷新
+#if ENABLE_FAST_LCD
+                    updateStateFast();
+#else
+                    updateDisplay();
+#endif
                 } else {
-                    stopDealing();  // 发完牌停止
+                    stopDealing();
                 }
             }
 
-            // 电机A停滞检测
             if (millis() - lastPhotoATime > MOTOR_A_STUCK_TIME && photoACount < nextStopCount) {
                 controlMotorA(false);
                 pauseDealing();
@@ -877,7 +907,6 @@ void handleMotorState() {
                 updateDisplay();
             }
 
-            // 电机A超时保护
             if (millis() - motorAStartTime > motorATimeout && isRunning == 1) {
                 controlMotorA(false);
                 pauseDealing();
@@ -906,7 +935,6 @@ void processInfraredInput() {
             return;
         }
 
-        // 红外防抖
         unsigned long now = millis();
         if (irValue == lastIRCommandValue && (now - lastIRCommandTime < IR_DEBOUNCE_TIME_VAL)) {
 #if IR_DEBUG
@@ -916,15 +944,11 @@ void processInfraredInput() {
             return;
         }
 
-        // 收到有效红外信号，非阻塞启动 LED 闪烁
-        // ★ 用 startBlink 替代原来的 blinkLEDBoth(200)，不再阻塞主循环，
-        //   避免电机干扰触发红外误码时把光电采样窗口堵死导致漏检
         startBlink(150);
 
         lastIRCommandTime = now;
         lastIRCommandValue = irValue;
 
-        // 非空闲状态（运行或暂停）只响应停止、发牌和比分调整
         if (isRunning != 0) {
             bool isStop = false, isStart = false;
 #if ENABLE_INFRA
@@ -940,7 +964,6 @@ void processInfraredInput() {
             } else if (isStart) {
                 startDealing();
             }
-            // 即使运行中也允许调整比分
 #if ENABLE_INFRA
             else if (irValue == IR_SCORE_X_INC) {
                 scoreX++; if (scoreX > 14) scoreX = 2;
@@ -956,16 +979,14 @@ void processInfraredInput() {
                 updateDisplay();
             }
 #endif
-            // 其他键忽略
             IrReceiver.resume();
             return;
         }
 
-        // 空闲状态处理
 #if ENABLE_INFRA
         if (irValue == IR_DEC_PLAYER) {
             if (playerCount > 2) playerCount--; else playerCount = 8;
-            initPositionCache();  // 更新缓存
+            initPositionCache();
             resetDealCounts();
             updateDisplay();
         } else
@@ -974,7 +995,7 @@ void processInfraredInput() {
         if (irValue == IR_RESET) {
             playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
             totalCards = deckCount * (hasJokers ? 54 : 52);
-            initPositionCache();  // 更新缓存
+            initPositionCache();
             resetDealCounts();
             updateDisplay();
         } else
@@ -989,7 +1010,7 @@ void processInfraredInput() {
 #endif
             false) {
             playerCount++; if (playerCount > 8) playerCount = 2;
-            initPositionCache();  // 更新缓存
+            initPositionCache();
             resetDealCounts();
             updateDisplay();
         } else
@@ -1048,7 +1069,7 @@ void processInfraredInput() {
             lcd.clear();
             fullRefresh = true;
             lcd.print(F("Idle"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
         } else
 #endif
@@ -1061,7 +1082,7 @@ void processInfraredInput() {
             irValue == IR2_REMAIN_CARDS ||
 #endif
             false) {
-            remainCards += 1;   // 每次增加1，而非playerCount
+            remainCards += 1;
             if (remainCards > playerCount * 4) remainCards = 0;
             totalCards = deckCount * (hasJokers ? 54 : 52);
             if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
@@ -1082,19 +1103,19 @@ void processInfraredInput() {
             controlMotorA(true);
             unsigned long testStart = millis();
             bool testComplete = false;
-            while (!testComplete && millis() - testStart < 1500) {  // 从2000ms减少到1500ms
+            while (!testComplete && millis() - testStart < 1500) {
                 updatePhotoA();
                 if (photoACount >= nextStopCount) {
                     controlMotorA(false);
                     testComplete = true;
                 }
-                delay(2);  // 进一步减少延迟
+                delay(2);
             }
             if (!testComplete) stopAllMotors();
             lcd.clear();
             fullRefresh = true;
             lcd.print(F("Test done"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
         } else
 #endif
@@ -1111,14 +1132,14 @@ void processInfraredInput() {
                 unsigned long testStartB = millis();
                 bool cardDetected = false;
                 lastPhotoBState = digitalRead(PHOTO_B_PIN);
-                while (millis() - testStartB < 2000) {  // 从3000ms减少到2000ms
+                while (millis() - testStartB < 2000) {
                     uint8_t cur = digitalRead(PHOTO_B_PIN);
                     if (cur == LOW && lastPhotoBState == HIGH) {
                         cardDetected = true;
                         break;
                     }
                     lastPhotoBState = cur;
-                    delay(2);  // 进一步减少延迟
+                    delay(2);
                 }
                 controlMotorB(false);
                 lcd.clear();
@@ -1126,7 +1147,7 @@ void processInfraredInput() {
                 if (cardDetected) lcd.print(F("B OK"));
                 else lcd.print(F("B TO"));
             }
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
         } else
 #endif
@@ -1153,7 +1174,7 @@ void processInfraredInput() {
             lcd.print(clockwise ? F("CCW") : F("CW"));
             lcd.setCursor(0, 1);
             lcd.print(F("Please Calib A"));
-            delay(600);  // 进一步减少延迟
+            delay(600);
             updateDisplay();
         } else
 #endif
@@ -1163,12 +1184,11 @@ void processInfraredInput() {
         } else
 #endif
 #if ENABLE_INFRA
-        // 重启键 IR_REBOOT 调用 resetFunc()
         if (irValue == IR_REBOOT) {
 #if IR_DEBUG
             Serial.println(F("Rebooting via resetFunc..."));
 #endif
-            delay(30);  // 进一步减少延迟
+            delay(30);
             resetFunc();
         } else
 #endif
@@ -1179,11 +1199,10 @@ void processInfraredInput() {
             lcd.print(F("Dealer v40.4"));
             lcd.setCursor(0, 1);
             lcd.print(F("16-edge mode"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
         } else
 #endif
-        // 空闲状态下也处理比分调整
 #if ENABLE_INFRA
         if (irValue == IR_SCORE_X_INC) {
             scoreX++; if (scoreX > 14) scoreX = 2;
@@ -1241,7 +1260,7 @@ void handleSerialCommand(const char* command) {
         lcd.clear();
         fullRefresh = true;
         lcd.print(F("Not supported"));
-        delay(300);  // 进一步减少延迟
+        delay(300);
         updateDisplay();
         return;
     }
@@ -1252,12 +1271,12 @@ void handleSerialCommand(const char* command) {
             lcd.print(F("Dealer v40.4"));
             lcd.setCursor(0, 1);
             lcd.print(F("16-edge mode"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
             break;
         case 'p': case 'P':
             playerCount++; if (playerCount > 8) playerCount = 2;
-            initPositionCache();  // 更新缓存
+            initPositionCache();
             resetDealCounts();
             updateDisplay();
             break;
@@ -1274,7 +1293,7 @@ void handleSerialCommand(const char* command) {
             updateDisplay();
             break;
         case 'r': case 'R':
-            remainCards += 1;   // 每次增加1，而非playerCount
+            remainCards += 1;
             if (remainCards > playerCount * 4) remainCards = 0;
             totalCards = deckCount * (hasJokers ? 54 : 52);
             if (remainCards > 0 && totalCards > remainCards) totalCards -= remainCards;
@@ -1288,7 +1307,7 @@ void handleSerialCommand(const char* command) {
             playerCount = 4; deckCount = 3; hasJokers = 1; remainCards = 0;
             stopDealing();
             totalCards = deckCount * (hasJokers ? 54 : 52);
-            initPositionCache();  // 更新缓存
+            initPositionCache();
             resetDealCounts();
             updateDisplay();
             break;
@@ -1308,19 +1327,19 @@ void handleSerialCommand(const char* command) {
                 controlMotorA(true);
                 unsigned long testStart = millis();
                 bool testComplete = false;
-                while (!testComplete && millis() - testStart < 1500) {  // 从2000ms减少到1500ms
+                while (!testComplete && millis() - testStart < 1500) {
                     updatePhotoA();
                     if (photoACount >= nextStopCount) {
                         controlMotorA(false);
                         testComplete = true;
                     }
-                    delay(2);  // 进一步减少延迟
+                    delay(2);
                 }
                 if (!testComplete) stopAllMotors();
                 lcd.clear();
                 fullRefresh = true;
                 lcd.print(F("Test done"));
-                delay(300);  // 进一步减少延迟
+                delay(300);
                 updateDisplay();
             }
             break;
@@ -1336,21 +1355,21 @@ void handleSerialCommand(const char* command) {
                 unsigned long testStart = millis();
                 bool cardDetected = false;
                 lastPhotoBState = digitalRead(PHOTO_B_PIN);
-                while (millis() - testStart < 2000) {  // 从3000ms减少到2000ms
+                while (millis() - testStart < 2000) {
                     uint8_t cur = digitalRead(PHOTO_B_PIN);
                     if (cur == LOW && lastPhotoBState == HIGH) {
                         cardDetected = true;
                         break;
                     }
                     lastPhotoBState = cur;
-                    delay(2);  // 进一步减少延迟
+                    delay(2);
                 }
                 controlMotorB(false);
                 lcd.clear();
                 fullRefresh = true;
                 if (cardDetected) lcd.print(F("B OK"));
                 else lcd.print(F("B TO"));
-                delay(300);  // 进一步减少延迟
+                delay(300);
                 updateDisplay();
             }
             break;
@@ -1364,7 +1383,7 @@ void handleSerialCommand(const char* command) {
             lcd.print(clockwise ? F("CCW") : F("CW"));
             lcd.setCursor(0, 1);
             lcd.print(F("Calib A"));
-            delay(600);  // 进一步减少延迟
+            delay(600);
             updateDisplay();
             break;
         case 'z': case 'Z':
@@ -1377,7 +1396,7 @@ void handleSerialCommand(const char* command) {
             lcd.clear();
             fullRefresh = true;
             lcd.print(F("No circle adj"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
             break;
         case 'h': case 'H':
@@ -1392,7 +1411,7 @@ void handleSerialCommand(const char* command) {
             lcd.clear();
             fullRefresh = true;
             lcd.print(F("?"));
-            delay(300);  // 进一步减少延迟
+            delay(300);
             updateDisplay();
             break;
     }
@@ -1413,13 +1432,10 @@ void resetSystem() {
     nextStopCount = 0;
     cardIgnoreUntil = 0;
     waitingCardClear = false;
-    bActivityInA = false;
-    lastPhotoBInA = HIGH;
-    bRestartTime = 0;
+    assumedMissed = 0;
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
 
-    // 等电机停止、电源稳定后重新初始化 LCD
     delay(20);
     lcd.begin(16, 2);
     delay(10);
@@ -1430,22 +1446,20 @@ void resetSystem() {
     lcd.print(F("Homing"));
     delay(300);
 
-    initPositionCache();  // 重置缓存
+    initPositionCache();
 
     updateDisplay();
-    setLED(1, 0);  // 复位后红色
+    setLED(1, 0);
 }
 
-// ==================== LCD 显示（局部刷新）====================
+// ==================== LCD 显示 ====================
 void updateDisplay() {
     if (fullRefresh) {
-        // 全刷新：用空格覆盖两行，避免 lcd.clear() 指令被干扰后整屏错位
-        lcd.setCursor(0, 0);
-        lcd.print(F("                "));
-        lcd.setCursor(0, 1);
-        lcd.print(F("                "));
-
-        // ---- 第一行固定字符 ----
+        //lcd.setCursor(0, 0);
+        //lcd.print(F("                "));
+        //lcd.setCursor(0, 1);
+        //lcd.print(F("                "));
+        lcd.clear();
         lcd.setCursor(0, 0); lcd.print('P');
         lcd.setCursor(2, 0); lcd.print(' ');
         lcd.setCursor(3, 0); lcd.print('D');
@@ -1454,13 +1468,11 @@ void updateDisplay() {
         lcd.setCursor(10,0); lcd.print(':');
         lcd.setCursor(13,0); lcd.print(' ');
 
-        // ---- 第二行固定字符 ----
         lcd.setCursor(0, 1); lcd.print('D');
         lcd.setCursor(1, 1); lcd.print(':');
         lcd.setCursor(5, 1); lcd.print('/');
         lcd.setCursor(9, 1); lcd.print(' ');
 
-        // 更新所有变量
         lcd.setCursor(1, 0); lcd.print(playerCount);
         lcd.setCursor(4, 0); lcd.print(deckCount);
         lcd.setCursor(6, 0); lcd.print(hasJokers ? 'J' : 'N');
@@ -1492,7 +1504,6 @@ void updateDisplay() {
         lcd.setCursor(14, 1); sprintf(buf, "%-3d", photoACount); lcd.print(buf);
 #endif
 
-        // 更新所有 last_* 变量
         lastPlayerCount = playerCount;
         lastDeckCount = deckCount;
         lastHasJokers = hasJokers;
@@ -1507,7 +1518,6 @@ void updateDisplay() {
 
         fullRefresh = false;
     } else {
-        // 局部刷新：只更新变化的部分
         if (playerCount != lastPlayerCount) {
             lcd.setCursor(1, 0); lcd.print(playerCount);
             lastPlayerCount = playerCount;
@@ -1536,7 +1546,6 @@ void updateDisplay() {
         }
 
         if (dealtCards != lastDealtCards) {
-            // 手动写字符，避免 sprintf 在电机运行时拉长 LCD 受干扰窗口
             uint8_t h = dealtCards / 100;
             uint8_t t = (dealtCards / 10) % 10;
             uint8_t o = dealtCards % 10;
@@ -1607,7 +1616,6 @@ void updateDisplay() {
 
 // ==================== 显示临时消息 ====================
 void showStatusMessage(const char* message) {
-    // 用空格覆盖两行，避免 lcd.clear() 指令被干扰
     lcd.setCursor(0, 0);
     lcd.print(F("                "));
     lcd.setCursor(0, 1);
@@ -1626,7 +1634,7 @@ void showStatusMessage(const char* message) {
 
 // ==================== SETUP ====================
 void setup() {
-    delay(150);  // 进一步减少延迟
+    delay(150);
     pinMode(MOTOR_A_IN1, OUTPUT);
     pinMode(MOTOR_A_IN2, OUTPUT);
     pinMode(MOTOR_A_PWM, OUTPUT);
@@ -1646,11 +1654,11 @@ void setup() {
     lcd.setCursor(0, 1);
     lcd.print(F("Homing"));
 
-    setLED(1, 0);  // 上电红色
+    setLED(1, 0);
 
 #if DEBUG
     Serial.begin(9600);
-    delay(150);  // 进一步减少延迟
+    delay(150);
     Serial.println(F("=== System Startup (16-edge mode) ==="));
     Serial.println(F("Players: 2-8, Direction: CCW (default)"));
 #endif
@@ -1667,10 +1675,8 @@ void setup() {
     serialBufferIndex = 0;
     serialBuffer[0] = '\0';
 
-    // 初始化位置缓存
     initPositionCache();
 
-    // 初始化上次显示值，确保第一次 updateDisplay() 全刷新
     lastPlayerCount = 0;
     lastDeckCount = 0;
     lastHasJokers = 0;
@@ -1685,7 +1691,7 @@ void setup() {
 
     performInitialHoming();
 
-    fullRefresh = true;   // 归位后需要全刷新
+    fullRefresh = true;
     updateDisplay();
 
 #if DEBUG
@@ -1706,7 +1712,6 @@ void loop() {
     if (isRunning == 1) {
         handleMotorState();
     }
-    // 非阻塞 LED 闪烁更新
     updateBlink();
 
 #if DEBUG
@@ -1728,5 +1733,5 @@ void loop() {
         lastDebugTime = millis();
     }
 #endif
-    delay(LOOP_DELAY);  // 使用优化的循环延迟
+    delay(LOOP_DELAY);
 }
