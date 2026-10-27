@@ -1,27 +1,27 @@
 Item,Reference,Quantity,Value,Footprint,Manufacturer,MPN,Supplier,Supplier_PN,Description,RoHS
-1,U1,1,Arduino Uno R3,Module_Arduino_Uno_R3,Arduino,A000066,LCSC,待核实,ATmega328P 开发板 5V/16MHz,Y
-2,U2,1,TB6612FNG Module,Module_TB6612FNG_16P,Toshiba,TB6612FNG,LCSC,待核实,双路直流电机驱动 1.2A/3.2A,Y
-3,DS1,1,LCD1602 16x2 5V,LCD1602_Parallel_16P,Generic,LCM1602A,LCSC,待核实,字符型 LCD 并行 4 位模式,Y
-4,IR1,1,VS1838B,IR_Receiver_3P,Generic,VS1838B,LCSC,待核实,38kHz 红外接收头,Y
-5,PH1,1,ITR9608,Opto_Slot_4P,Everlight,ITR9608,LCSC,待核实,槽型光耦 电机A计数,Y
-6,PH2,1,ITR9608,Opto_Slot_4P,Everlight,ITR9608,LCSC,待核实,槽型光耦 电机B发牌检测,Y
-7,M1,1,DC Gear Motor,Motor_DC_2P,Generic,GA12-N20,LCSC,待核实,转盘减速电机 6V/12V,Y
-8,M2,1,DC Gear Motor,Motor_DC_2P,Generic,GA12-N20,LCSC,待核实,发牌减速电机 6V/12V,Y
-9,D1,1,LED Red 5mm,LED_5mm_2P,Generic,5mm Red,LCSC,待核实,电源/停止指示,Y
-10,D2,1,LED Green 5mm,LED_5mm_2P,Generic,5mm Green,LCSC,待核实,运行指示,Y
-11,R1,2,220R 1/4W,Resistor_0805_or_Axial,Generic,CFR-25JB-220R,LCSC,待核实,LED 限流,Y
-12,RV1,1,10k Multi-turn Pot,Potentiometer_3296W,Bourns,3296W-1-103LF,LCSC,待核实,LCD 对比度调节,Y
-13,C1,2,100uF/16V,Cap_Elec_D6.3x11,Generic,16V100uF,LCSC,待核实,电源去耦,Y
-14,C2,4,0.1uF/50V,Cap_Ceramic_0805,Generic,50V104,LCSC,待核实,IC 就近去耦,Y
-15,J1,1,DC Jack 5.5x2.1,Conn_DC_5.5x2.1,Generic,DC-005,LCSC,待核实,12V 电源输入,Y
-16,J2,1,KF128-2P 5.08mm,Terminal_KF128-2P,Cixi,KF128-2P-5.08,LCSC,待核实,电机 A 输出,Y
-17,J3,1,KF128-2P 5.08mm,Terminal_KF128-2P,Cixi,KF128-2P-5.08,LCSC,待核实,电机 B 输出,Y
-18,J4,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,待核实,光电 A 接口,Y
-19,J5,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,待核实,光电 B 接口,Y
-20,J6,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,待核实,红外接收接口,Y
-21,J7,1,Header 1x16 2.54mm,Conn_1x16_P2.54,Generic,1x16P 2.54,LCSC,待核实,LCD1602 排针,Y
-22,J8,2,Header 1x18 2.54mm,Conn_1x18_P2.54,Generic,1x18P 2.54,LCSC,待核实,Arduino Uno 排母 2 条,Y
-23,F1,1,Fuse 2A Slow 5x20mm,Fuse_Holder_5x20,Generic,2A 250V Slow,LCSC,待核实,电机回路保护,Y
-24,SW1,1,Rocker Switch 2A,Switch_KCD1,Generic,KCD1-2P,LCSC,待核实,总电源开关,Y
-25,U3,1,LM2596S-5.0 Module,Module_LM2596,Generic,LM2596S-5.0,LCSC,待核实,12V→5V 降压 2A,Y
-26,H1-H4,4,M3 Mounting Hole,MountingHole_M3,Generic,M3,LCSC,待核实,安装铜柱孔,N/A
+1,U1,1,Arduino Uno R3,Module_Arduino_Uno_R3,Arduino,A000066,LCSC,TBD,ATmega328P development board 5V/16MHz,Y
+2,U2,1,TB6612FNG Module,Module_TB6612FNG_16P,Toshiba,TB6612FNG,LCSC,TBD,Dual DC motor driver 1.2A/3.2A,Y
+3,DS1,1,LCD1602 16x2 5V,LCD1602_Parallel_16P,Generic,LCM1602A,LCSC,TBD,Character LCD parallel 4-bit mode,Y
+4,IR1,1,VS1838B,IR_Receiver_3P,Generic,VS1838B,LCSC,TBD,38kHz infrared receiver,Y
+5,PH1,1,ITR9608,Opto_Slot_4P,Everlight,ITR9608,LCSC,TBD,Slot optocoupler for Motor A counting,Y
+6,PH2,1,ITR9608,Opto_Slot_4P,Everlight,ITR9608,LCSC,TBD,Slot optocoupler for Motor B card detection,Y
+7,M1,1,DC Gear Motor,Motor_DC_2P,Generic,GA12-N20,LCSC,TBD,Carousel gear motor 6V/12V,Y
+8,M2,1,DC Gear Motor,Motor_DC_2P,Generic,GA12-N20,LCSC,TBD,Card-feed gear motor 6V/12V,Y
+9,D1,1,LED Red 5mm,LED_5mm_2P,Generic,5mm Red,LCSC,TBD,Power/stop indicator,Y
+10,D2,1,LED Green 5mm,LED_5mm_2P,Generic,5mm Green,LCSC,TBD,Run indicator,Y
+11,R1,2,220R 1/4W,Resistor_0805_or_Axial,Generic,CFR-25JB-220R,LCSC,TBD,LED current limiting,Y
+12,RV1,1,10k Multi-turn Pot,Potentiometer_3296W,Bourns,3296W-1-103LF,LCSC,TBD,LCD contrast adjustment,Y
+13,C1,2,100uF/16V,Cap_Elec_D6.3x11,Generic,16V100uF,LCSC,TBD,Power supply decoupling,Y
+14,C2,4,0.1uF/50V,Cap_Ceramic_0805,Generic,50V104,LCSC,TBD,IC local decoupling,Y
+15,J1,1,DC Jack 5.5x2.1,Conn_DC_5.5x2.1,Generic,DC-005,LCSC,TBD,12V power input,Y
+16,J2,1,KF128-2P 5.08mm,Terminal_KF128-2P,Cixi,KF128-2P-5.08,LCSC,TBD,Motor A output,Y
+17,J3,1,KF128-2P 5.08mm,Terminal_KF128-2P,Cixi,KF128-2P-5.08,LCSC,TBD,Motor B output,Y
+18,J4,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,TBD,Photo sensor A interface,Y
+19,J5,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,TBD,Photo sensor B interface,Y
+20,J6,1,XH2.54-3P,Conn_XH_1x3P,JST,XH2.54-3P,LCSC,TBD,IR receiver interface,Y
+21,J7,1,Header 1x16 2.54mm,Conn_1x16_P2.54,Generic,1x16P 2.54,LCSC,TBD,LCD1602 pin header,Y
+22,J8,2,Header 1x18 2.54mm,Conn_1x18_P2.54,Generic,1x18P 2.54,LCSC,TBD,Arduino Uno female headers (2 pcs),Y
+23,F1,1,Fuse 2A Slow 5x20mm,Fuse_Holder_5x20,Generic,2A 250V Slow,LCSC,TBD,Motor circuit protection,Y
+24,SW1,1,Rocker Switch 2A,Switch_KCD1,Generic,KCD1-2P,LCSC,TBD,Main power switch,Y
+25,U3,1,LM2596S-5.0 Module,Module_LM2596,Generic,LM2596S-5.0,LCSC,TBD,12V to 5V buck converter 2A,Y
+26,H1-H4,4,M3 Mounting Hole,MountingHole_M3,Generic,M3,LCSC,TBD,M3 mounting hole,N/A
