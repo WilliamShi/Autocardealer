@@ -1,0 +1,78 @@
+四、Gerber 输出清单（在 EDA 里一键导出）
+KiCad：File → Fabrication Outputs → Gerber；立创EDA：制造 → 生成Gerber。
+
+文件	层名	用途
+AutoCarDealer-F_Cu.gbr	Top Copper	顶层铜
+AutoCarDealer-B_Cu.gbr	Bottom Copper	底层铜
+AutoCarDealer-F_Silkscreen.gbr	Top Silk	顶层丝印
+AutoCarDealer-B_Silkscreen.gbr	Bottom Silk	底层丝印
+AutoCarDealer-F_Mask.gbr	Top Solder Mask	顶层阻焊
+AutoCarDealer-B_Mask.gbr	Bottom Solder Mask	底层阻焊
+AutoCarDealer-F_Paste.gbr	Top Paste（PCBA 时需要）	钢网
+AutoCarDealer-Edge_Cuts.gbr	Board Outline	板框
+AutoCarDealer-PTH.drl	Plated Through Holes	金属化孔
+AutoCarDealer-NPTH.drl	Non-Plated Through Holes	非金属化孔（安装孔）
+AutoCarDealer-job.gbrjob	Gerber Job	层信息（推荐）
+AutoCarDealer.pos	Pick & Place（PCBA 时需要）	坐标文件
+AutoCarDealer_BOM.csv	BOM	贴片/采购
+Gerber 输出参数（KiCad 8）
+
+Format: Gerber X2
+
+Units: mm
+
+Precision: 4.6
+
+Use extended X2 format: Yes
+
+Include netlist attributes: Yes
+
+Subtract soldermask from silkscreen: Yes
+
+Drill: Excellon, mm, PTH and NPTH separate files
+
+五、DRC 规则（导入 EDA 后设置）
+项目	值
+Min clearance	0.20 mm
+Min track width	0.20 mm
+Min via drill	0.30 mm
+Min via annular ring	0.13 mm
+Min hole to hole	0.50 mm
+Min copper to edge	0.30 mm
+Min silk to pad	0.15 mm
+Min hole to board edge	0.50 mm
+Power trace width	0.50 mm（5V）
+Motor trace width	2.00 mm（VM / 电机）
+Via current	1A / via（0.3 mm）
+六、装配说明（PCBA 下单时用）
+贴片面：仅 R1/R2、C3~C6 可 SMT，其余全部 THT。
+
+THT 手工焊接顺序：电阻/电容 → IC 座/排针 → 端子 → LCD 排针 → DC 座 → 开关。
+
+焊接温度：无铅 350°C，每点 ≤3 秒。
+
+清洗：免清洗助焊剂，不需水洗。
+
+三防漆：可选，涂覆电机驱动区和光电接口区。
+
+七、生产下单流程（从这份文档到实物）
+打开立创EDA / KiCad，新建 2 层工程，板框 100x80 mm。
+
+导入第 2 节的网表（KiCad 用 2.1，Altium/PADS 用 2.2）。
+
+按第三、五节的规则布局布线。
+
+DRC 通过后，按第四节参数导出 Gerber + 钻孔。
+
+用第一节 BOM 在立创商城下单元件（核实 LCSC 料号）。
+
+把 Gerber、BOM、第三节 Fab Notes 一起传给板厂 / PCBA 厂。
+
+收货后按 README 第 6 节流程装机调试。
+
+必须再次说明的一点
+我无法直接给你 .gbr、.drl、.pos 二进制文件，因为：
+
+Gerber 的坐标、光圈、D 码必须由 EDA 从实际布局计算，手写会出错。
+
+我给出的是生产所需的完整输入：标准 BOM、标准网表、制造图纸、Gerber 参数、层叠、DRC。这是工业上“设计交付包（Design Package）”的完整内容，板厂和 PCBA 厂拿到这些就能生产。

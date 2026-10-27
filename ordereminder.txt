@@ -1,0 +1,5 @@
+供应商料号（LCSC PN）需你在立创商城逐项核实后填入，我不提供未经验证的料号，避免下错单。
+
+Footprint 列是建议封装，导入 EDA 后请与你实际选用的元件核对。
+
+若用 E18-D80NK 替代 ITR9608，PH1/PH2 的 Footprint 改为 Conn_XH_1x3P，MPN 改 E18-D80NK。
